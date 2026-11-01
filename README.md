@@ -4,6 +4,18 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![Python](https://img.shields.io/badge/python-3.10%2B-green) ![License](https://img.shields.io/badge/license-MIT-orange)
 
+## 📸 界面预览
+
+| 概况 —— 一眼看清 C 盘 | 今日新增 —— 谁在往 C 盘塞东西 |
+|:---:|:---:|
+| ![概况页](docs/screenshots/overview.png) | ![今日新增页](docs/screenshots/today.png) |
+
+| 存量盘点 —— 装守卫之前谁占的空间 | 设置 —— 阈值多少你说了算 |
+|:---:|:---:|
+| ![存量盘点页](docs/screenshots/legacy.png) | ![设置页](docs/screenshots/settings.png) |
+
+> 截图由 `_shot_readme.py` 离屏渲染生成，页面中的数据为演示数据。
+
 ## ✨ 核心功能
 
 ### 🎨 全新界面（v6.7）
