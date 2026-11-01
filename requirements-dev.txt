@@ -1,0 +1,5 @@
+# C盘守卫 —— 开发 / 打包依赖
+# 安装：pip install -r requirements.txt -r requirements-dev.txt
+
+# 打包为单文件 exe（Windows）
+pyinstaller>=6.0

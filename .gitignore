@@ -1,0 +1,74 @@
+# ============================================================
+#  C盘守卫 .gitignore —— 发布到 GitHub 前的隐私与安全防线
+#  原则：凡是"只有你这台电脑才有的数据"，一律不进仓库。
+# ============================================================
+
+# ---- 1. 运行数据（含本机真实路径 / 已装软件清单，绝不上传）----
+# 今日新增扫描结果（含完整文件路径）
+today_files*.json
+便携版/today_files*.json
+# 存量盘点快照（含各盘目录与容量分布）
+legacy_*.json
+便携版/legacy_*.json
+# 用户配置（含白名单、清理策略）
+config.json
+便携版/config.json
+# 本机已安装软件清单
+install_known.json
+便携版/install_known.json
+# 用户根目录条目清单（泄露 Windows 用户名）
+root_known.json
+便携版/root_known.json
+# 软件存储限制规则（含用户自定义软件名）
+app_rules.json
+便携版/app_rules.json
+# 增长趋势 / 搬移记录 / 空间快照
+growth_state.json
+便携版/growth_state.json
+migrations.json
+便携版/migrations.json
+space_snapshots.json
+便携版/space_snapshots.json
+# 首次使用时间基线
+install_time.json
+便携版/install_time.json
+
+# ---- 2. 日志与报告 ----
+guard_log/
+便携版/guard_log/
+*.log
+*_2026*.csv
+*_2026*.html
+
+# ---- 3. 分发产物（exe / zip 改走 GitHub Releases，不进仓库）----
+便携版/
+*.exe
+*.zip
+*.7z
+
+# ---- 4. 构建产物 ----
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec.bak
+
+# ---- 5. 本机临时脚本与调试截图（含真实用户名路径，勿上传）----
+_scan_*.py
+_clean_*.py
+_test_ui_shot.py
+_ui_*.png
+_fix_*.png
+_empty_*.png
+_lg*.png
+
+# ---- 6. 图标母版（外部提供的设计稿，来源未经确权，不随 MIT 仓库分发）----
+# 已生成的图标产物（guard_icon.ico / guard_icon_preview.png / guard_icon_256.png）
+# 已在仓库内，可直接打包使用；重新生成方法见 make_icon.py 顶部说明。
+icon_source.jpg
+
+# ---- 7. 系统 / 编辑器 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
