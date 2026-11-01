@@ -67,6 +67,16 @@ def _dir_oldest_ctime(app_dir: Path):
     return oldest
 
 
+def _exe_ctime():
+    """程序本体（exe）的创建时间。数据目录为空时用它推断安装日。"""
+    try:
+        import sys
+        exe = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__)
+        return float(exe.stat().st_ctime)
+    except Exception:
+        return None
+
+
 def load_install_time(app_dir: Path) -> dict:
     """读出守卫生日。
 
@@ -85,6 +95,12 @@ def load_install_time(app_dir: Path) -> dict:
 
     now = time.time()
     guess = _dir_oldest_ctime(app_dir)
+    # 数据目录可能是刚建的（换电脑、或装在 Program Files 时数据落到
+    # %LOCALAPPDATA%），这时用程序本体（exe）的创建时间兜底，
+    # 比直接取"今天"更接近真实的安装日期。
+    exe_guess = _exe_ctime()
+    if exe_guess and (not guess or exe_guess < guess):
+        guess = exe_guess
     if guess and guess < now:
         info = {"ts": float(guess),
                 "source": "按本程序数据目录里最早的文件推断"}

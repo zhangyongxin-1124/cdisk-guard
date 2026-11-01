@@ -25,7 +25,7 @@ MB = 1024 * 1024
 GB = 1024 ** 3
 
 # 本软件数据目录（与主程序同目录；frozen 时由主程序注入）
-APP_DIR = Path(os.environ.get("GUARD_APP_DIR") or Path(__file__).parent)
+from guard_appdir import APP_DIR
 STATE_PATH = APP_DIR / "cleaner_state.json"
 
 # ============================================================

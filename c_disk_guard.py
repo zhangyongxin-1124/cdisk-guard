@@ -70,10 +70,15 @@ import guard_dashboard
 # 路径与配置
 # ============================================================
 
-APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+# 数据目录由 guard_appdir 统一决定：优先 exe 同目录（便携模式），
+# 装在 Program Files 等只读位置时自动回退到 %LOCALAPPDATA%；
+# 并且会清理掉从别的电脑带过来的旧数据（否则会显示别人的扫描结果）。
+from guard_appdir import APP_DIR
 CONFIG_PATH = APP_DIR / "config.json"
 LOG_DIR = APP_DIR / "guard_log"
-C_USER = Path(os.environ.get("USERPROFILE", r"C:\Users\HIAPAD"))
+# 当前登录用户的家目录。绝不写死成某个具体用户名——那样换台电脑
+# 监控的就是一个不存在的目录，拦截永远不会触发。
+C_USER = Path(os.environ.get("USERPROFILE") or str(Path.home()))
 
 DEFAULT_CONFIG = {
     # ---- 重点目录：这里出现的新文件，不论大小都会询问 ----
@@ -705,6 +710,16 @@ class Guard:
                 need_write = True
         else:
             need_write = True
+
+        # 换电脑适配：配置里若还写着上一台电脑的用户目录（C:\Users\别人\...），
+        # 自动改指当前登录用户。不改的话监控的是一个不存在的目录，拦截永不触发。
+        try:
+            from guard_appdir import relocate_user_paths
+            if relocate_user_paths(cfg).get("changed"):
+                need_write = True
+        except Exception:
+            pass
+
         if need_write:
             try:
                 CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
@@ -1996,9 +2011,9 @@ def test_space_report():
     print()
     print("—— 删除隐患评估预览 ——")
     demo = [
-        (Path(r"C:\Users\HIAPAD\Documents\报价单.xlsx"), 240_000),
-        (Path(r"C:\Users\HIAPAD\Desktop\照片.jpg"), 5_000_000),
-        (Path(r"C:\Users\HIAPAD\AppData\Local\Foo\foo.dll"), 120_000),
+        (Path(str(C_USER / "Documents" / "报价单.xlsx")), 240_000),
+        (Path(str(C_USER / "Desktop" / "照片.jpg")), 5_000_000),
+        (Path(str(C_USER / "AppData" / "Local" / "Foo" / "foo.dll")), 120_000),
     ]
     for p, s in demo:
         level, icon, notes = assess_delete(p, s, in_recycle=True)

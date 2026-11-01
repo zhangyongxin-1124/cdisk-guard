@@ -34,8 +34,7 @@ except ImportError:  # pragma: no cover
     winreg = None
 
 
-APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) \
-    else Path(__file__).parent
+from guard_appdir import APP_DIR
 LOG_DIR = APP_DIR / "guard_log"
 SNAPSHOT_FILE = APP_DIR / "space_snapshots.json"
 

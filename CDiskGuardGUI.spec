@@ -9,7 +9,7 @@ a = Analysis(
     hiddenimports=['guard_cleaner', 'guard_rules', 'guard_today', 'guard_drives',
                    'guard_dashboard', 'guard_growth', 'guard_quarantine',
                    'guard_paths', 'guard_wizard', 'guard_bridge', 'guard_theme',
-                   'guard_legacy',
+                   'guard_legacy', 'guard_appdir',
                    'PySide6.QtSvg'],
     hookspath=[],
     hooksconfig={},

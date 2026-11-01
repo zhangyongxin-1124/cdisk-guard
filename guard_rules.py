@@ -19,8 +19,7 @@ import time
 from pathlib import Path
 import sys
 
-APP_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
-           else Path(__file__).parent)
+from guard_appdir import APP_DIR
 DATA_FILE = APP_DIR / "app_rules.json"
 
 # 用户输入软件名时，自动剥掉的通用后缀（避免"酷狗音乐"只剩"音乐"这种泛词）

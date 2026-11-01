@@ -31,8 +31,7 @@ import guard_paths as gp
 
 # 打包成 exe 后 __file__ 指向的是 PyInstaller 的临时解压目录（退出就没了），
 # 所以必须改用 exe 所在目录，否则配置和状态每关一次程序就丢一回。
-APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) \
-    else Path(__file__).parent
+from guard_appdir import APP_DIR
 STATE_FILE = APP_DIR / "growth_state.json"
 
 INSTALLER_EXT = {".exe", ".msi", ".msix", ".zip", ".rar", ".7z", ".iso",

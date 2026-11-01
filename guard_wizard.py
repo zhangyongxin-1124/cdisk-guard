@@ -46,8 +46,8 @@ except ImportError:  # pragma: no cover
 # 常量
 # ============================================================
 
-APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) \
-    else Path(__file__).parent
+from guard_appdir import APP_DIR
+
 MIGRATIONS_FILE = APP_DIR / "migrations.json"
 FOLDER_BACKUP = APP_DIR / "folder_locations_backup.json"
 

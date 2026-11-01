@@ -41,7 +41,21 @@ from PySide6.QtWidgets import (
     QDateEdit, QTableWidget, QTableWidgetItem,
 )
 
-APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+from guard_appdir import APP_DIR        # 统一数据目录（自动适配本机）
+
+# 程序自带的静态资源（图标、声明文件）放在 exe 旁边，不属于"数据"，
+# 因此始终按 exe 所在目录找——数据目录可能已回退到 %LOCALAPPDATA%。
+EXE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) \
+    else Path(__file__).parent
+
+
+def _resource(name: str) -> Path:
+    """找程序自带资源：先 exe 同目录，找不到再看数据目录。"""
+    for base in (EXE_DIR, APP_DIR):
+        p = base / name
+        if p.exists():
+            return p
+    return EXE_DIR / name
 sys.path.insert(0, str(APP_DIR))
 
 import c_disk_guard as engine
@@ -57,7 +71,7 @@ import guard_theme as GT
 from guard_bridge import bridge, IDYES, IDNO, IDCANCEL, IDOK
 
 APP_NAME = "C盘守卫"
-ICON_PATH = APP_DIR / "guard_icon.ico"
+ICON_PATH = _resource("guard_icon.ico")
 MB = engine  # 常量速记
 
 # ============================================================
@@ -3359,7 +3373,7 @@ class MainWindow(QMainWindow):
 
     def _open_notices(self):
         """打开第三方组件声明文件（没有则现场生成一份基础版）。"""
-        notice = APP_DIR / "THIRD_PARTY_NOTICES.txt"
+        notice = _resource("THIRD_PARTY_NOTICES.txt")
         if not notice.exists():
             try:
                 notice.write_text(
@@ -3498,6 +3512,16 @@ class MainWindow(QMainWindow):
 
 def main():
     global _guard_ref
+
+    # 本机适配：数据目录若带着别的电脑的扫描数据（整个目录拷贝过来的情况），
+    # 自动归档重建，保证看到的一定是这台电脑自己的内容。
+    try:
+        import guard_appdir
+        _r = guard_appdir.ensure_local_data()
+        if _r.get("purged"):
+            print("[守卫] 已按本机重新初始化，旧数据归档到：", _r.get("backup"))
+    except Exception as _e:
+        print("[守卫] 本机适配检查失败（不影响使用）：", _e)
 
     # 高 DPI 下按实际缩放逐像素渲染，避免系统位图拉伸造成的文字发虚
     try:
