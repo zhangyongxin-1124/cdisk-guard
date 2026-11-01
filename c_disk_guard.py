@@ -89,11 +89,19 @@ DEFAULT_CONFIG = {
         "图片": str(C_USER / "Pictures"),
         "视频": str(C_USER / "Videos"),
     },
-    # ---- 全盘写入拦截：监听整个用户目录（含 AppData 里的软件数据）----
+    # ---- 全盘写入拦截：监听整个 C 盘（递归）----
+    # 之前只监听 C:\Users\<用户>，把文件复制/移动到 C 盘根目录或其他位置
+    # 根本不会触发询问。现在直接监听 C:\ 根，配合排除关键词滤掉系统噪音。
     "全盘拦截": True,
-    "全盘监控根": [str(C_USER)],
-    # 这些路径下的写入不打扰（缓存/临时/系统自动生成，问也问不完）
+    "全盘监控根": ["C:\\"],
+    # 这些路径下的写入不打扰（系统/缓存/临时/软件自动生成，问也问不完）
     "排除路径关键词": [
+        "\\windows\\",
+        "\\program files\\",
+        "\\program files (x86)\\",
+        "\\programdata\\",
+        "\\system volume information\\",
+        "\\users\\all users\\",
         "\\appdata\\",
         "\\.namiwork",
         "\\.workbuddy",
@@ -115,6 +123,10 @@ DEFAULT_CONFIG = {
     "单文件询问阈值MB": 10,
     # 全盘模式下：非重点目录里，累计新增超过多少 MB 就合并询问一次
     "批量询问阈值MB": 50,
+    # ---- 搬家行为 ----
+    # True ：目录搬到其他盘后，C 盘原位置留一个透明链接，依赖原路径的软件照常可用
+    # False：搬走后 C 盘原位置干干净净，什么都不留（注意：软件下次写入时可能在 C 盘重建）
+    "搬家后原位置留链接": False,
     # ---- 删除保护 ----
     "删除保护": True,
     # 删除哪些位置的提示（空 = 所有位置）
@@ -720,6 +732,18 @@ class Guard:
         except Exception:
             pass
 
+        # 监控范围升级：老版本只监听用户目录（C:\Users\<用户>），把文件复制/移动
+        # 到 C 盘根目录或其他位置不会触发询问。统一升级为监听整个 C 盘，
+        # 并补齐新增的系统目录排除词（旧配置里没有，不补会噪音爆炸）。
+        if cfg.get("全盘拦截") and list(cfg.get("全盘监控根") or []) != ["C:\\"]:
+            cfg["全盘监控根"] = ["C:\\"]
+            need_write = True
+        kws = list(cfg.get("排除路径关键词") or [])
+        miss = [k for k in DEFAULT_CONFIG["排除路径关键词"] if k not in kws]
+        if miss:
+            cfg["排除路径关键词"] = kws + miss
+            need_write = True
+
         if need_write:
             try:
                 CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
@@ -887,13 +911,17 @@ class Guard:
         if decision == "keep":
             self.log("根目录", p.name, size, "同意保留")
             return
-        # decision = 目标盘根路径 → 搬移 + 创建链接
+        # decision = 目标盘根路径 → 搬移
         dest = self.move_dir_junction(p, decision)
         if dest:
-            self.log("根目录", p.name, size, "搬移并创建链接", dest)
+            keep = bool(self.config.get("搬家后原位置留链接", False))
+            tail = ("原位置已创建「链接」，相关软件照常可用，C 盘空间已释放。"
+                    if keep else
+                    "C 盘原位置已清空，不再保留。\n"
+                    "（注意：相关软件下次运行时若找不到该文件夹，可能会在 C 盘重建）")
+            self.log("根目录", p.name, size, "搬移完成" + ("（留链接）" if keep else ""), dest)
             alert_box("C 盘守卫 — 搬移完成",
-                      f"文件夹 {p.name} 已搬到：\n{dest}\n\n"
-                      "原位置已创建「链接」，相关软件照常可用，C 盘空间已释放。",
+                      f"文件夹 {p.name} 已搬到：\n{dest}\n\n{tail}",
                       MB_ICONINFO)
         else:
             self.log("根目录", p.name, size, "搬移失败-保留原地")
@@ -913,7 +941,7 @@ class Guard:
                 f"📦 已占用：{human_size(size)}\n"
                 f"📍 位置：{p.parent}\n\n"
                 "【是】保留在 C 盘（以后不再问这个文件夹）\n"
-                "【否】搬到其他盘，并在原位置创建链接（软件照常可用）\n"
+                "【否】搬到其他盘，C 盘原位置不再保留\n"
                 "【取消】暂时不动，1 小时后再提醒")
         r = alert_box("C 盘守卫 — 用户目录出现新文件夹", body,
                       MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2)
@@ -925,8 +953,15 @@ class Guard:
             return root if root else "skip"
         return "skip"
 
-    def move_dir_junction(self, src: Path, dest_root: str) -> str:
-        """把整个文件夹搬到其他盘，在原位置创建 junction 链接；失败则回滚。"""
+    def move_dir_junction(self, src: Path, dest_root: str, keep_link=None) -> str:
+        """把整个文件夹搬到其他盘；失败则回滚。
+
+        keep_link=True ：原位置建 junction 链接，依赖原路径的软件照常可用；
+        keep_link=False：搬走后 C 盘原位置不留任何东西；
+        None（默认）   ：读配置「搬家后原位置留链接」。
+        """
+        if keep_link is None:
+            keep_link = bool(self.config.get("搬家后原位置留链接", False))
         dest_root_p = Path(dest_root)
         dest = dest_root_p / src.name
         i = 1
@@ -938,6 +973,9 @@ class Guard:
             shutil.move(str(src), str(dest))
         except (PermissionError, OSError, shutil.Error):
             return ""
+        self.self_actions[str(src)] = time.time()
+        if not keep_link:
+            return str(dest)                       # 不留链接：C 盘原位置已空
         try:
             r = subprocess.run(["cmd", "/c", "mklink", "/J", str(src), str(dest)],
                                capture_output=True, creationflags=0x08000000)
@@ -949,7 +987,6 @@ class Guard:
             except Exception:
                 pass
             return ""
-        self.self_actions[str(src)] = time.time()
         return str(dest)
 
     # ---------- 目标盘 ----------
@@ -1605,6 +1642,10 @@ class Guard:
             w = TreeWatcher(r, self.q, self.stop_evt, filter_fn=self.is_excluded)
             w.start()
             self.watchers.append(w)
+        if not roots and self.config.get("全盘拦截", True):
+            # 配置里写了监控根但目录不存在：拦截等于没有，必须留下记录便于排查
+            self.log("监听", Path("C:\\"), 0,
+                     "未启动-监控根目录不存在: " + "; ".join(self.config.get("全盘监控根", [])))
         return roots
 
     def consume_events(self, now):

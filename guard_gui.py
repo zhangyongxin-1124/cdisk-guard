@@ -241,7 +241,7 @@ class RootFolderDialog(QDialog):
         keep = QPushButton("保留在 C 盘（以后不再问）")
         keep.setMinimumHeight(34)
         keep.setStyleSheet("background:#2f7d32; color:white; font-weight:bold;")
-        move = QPushButton("搬到其他盘并创建链接（推荐，C 盘立刻释放）")
+        move = QPushButton("搬到其他盘（C 盘立刻释放）")
         move.setMinimumHeight(34)
         move.setStyleSheet("background:#1565c0; color:white; font-weight:bold;")
         later = QPushButton("稍后再问（1 小时后提醒）")
@@ -812,7 +812,9 @@ class GuiGuard(engine.Guard):
                 "C盘守卫 — 选择搬移位置",
                 f"把「{name}」的这些内容（{len(items)} 项，"
                 f"{engine.human_size(total)}）搬到哪个盘？\n\n"
-                "搬走后原位置会留一个链接，软件照常使用，C 盘空间立即释放。")
+                + ("搬走后原位置会留一个链接，软件照常使用，C 盘空间立即释放。"
+                   if self.config.get("搬家后原位置留链接", False)
+                   else "搬走后 C 盘原位置清空、不再保留，C 盘空间立即释放。"))
             if not root:
                 for p, s in items:
                     self.log("限制", p.name, s, f"未选盘-保留C盘-{name}")
@@ -911,13 +913,17 @@ class GuiGuard(engine.Guard):
     def ask_root_folder(self, p, size):
         if self.auto_choice:
             return "keep"
+        keep = bool(self.config.get("搬家后原位置留链接", False))
+        tail = ("选择「搬到其他盘」后：文件夹实体移到其他盘，原位置留一个透明链接，\n"
+                "相关软件照常使用，C 盘空间立即释放。"
+                if keep else
+                "选择「搬到其他盘」后：文件夹整体移到其他盘，\n"
+                "C 盘原位置清空、不再保留任何东西。")
         text = (f"你的用户目录里出现一个新文件夹，可能又有一个软件要把东西存进 C 盘：\n\n"
                 f"📁 文件夹：{p.name}\n"
                 f"📦 已占用：{engine.human_size(size)}\n"
                 f"📍 位置：{p.parent}\n"
-                f"🏷️ 疑似来源：{guard_today.guess_app(str(p) + p.name)}\n\n"
-                "选择「搬移并创建链接」后：文件夹实体移到其他盘，原位置留一个透明链接，\n"
-                "相关软件照常使用，C 盘空间立即释放。")
+                f"🏷️ 疑似来源：{guard_today.guess_app(str(p) + p.name)}\n\n{tail}")
         res = bridge.dialog({"type": "root_folder",
                              "title": "C盘守卫 — 用户目录出现新文件夹", "text": text})
         c = res.get("choice")
@@ -2645,7 +2651,9 @@ class MainWindow(QMainWindow):
         ok = bridge.ask(APP_NAME,
                         f"把选中的 {len(targets)} 组内容移动到：{dest_root} ？\n\n"
                         "采用「先复制、成功后删源」，失败项原地保留。\n"
-                        "搬好后会在原位置留一块「门牌」指向新家，软件路径不变、正常使用。",
+                        + ("搬好后会在原位置留一块「门牌」指向新家，软件路径不变、正常使用。"
+                           if self.guard.config.get("搬家后原位置留链接", False)
+                           else "搬好后 C 盘原位置清空、不再保留。"),
                         "yesno", "question")
         if ok != IDYES:
             return
@@ -2667,7 +2675,9 @@ class MainWindow(QMainWindow):
                     except OSError:
                         failed += 1
                         continue
-                    res = guard_wizard.migrate_app_dir(src, dst)
+                    res = guard_wizard.migrate_app_dir(
+                        src, dst,
+                        keep_link=bool(self.guard.config.get("搬家后原位置留链接", False)))
                     if res.get("ok"):
                         msgs.append(f"目录已搬：{src.name} → {dst}")
                     else:
@@ -3252,7 +3262,8 @@ class MainWindow(QMainWindow):
         gl.addLayout(self._card_title("守护开关"))
         self.sw = {}
         for key, title, desc in (
-                ("全盘拦截", "全部写入拦截", "AppData 等位置也盯"),
+                ("全盘拦截", "全部写入拦截", "监听整个 C 盘（系统目录自动排除），往哪存都问"),
+                ("搬家后原位置留链接", "搬家后原位置留链接", "开启：搬走的目录在 C 盘原位置留透明链接，依赖原路径的软件不受影响；关闭：C 盘原位置不留任何东西"),
                 ("删除保护", "删除保护", "回收站删除时提醒，并先送隔离区"),
                 ("聚合提示", "聚合监控", "同一来源的零散写入合并成一次询问，不刷屏"),
                 ("监控软件安装", "安装哨兵", "软件装进 C 盘时提醒"),

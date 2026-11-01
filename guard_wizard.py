@@ -238,8 +238,12 @@ def save_migrations(rows: list):
 # 执行：两类迁移
 # ============================================================
 
-def migrate_app_dir(src: Path, dst: Path, log=print) -> dict:
-    """应用数据：复制 → 校验 → 重命名源 → 建联接 → 清理旧数据。"""
+def migrate_app_dir(src: Path, dst: Path, log=print, keep_link: bool = True) -> dict:
+    """应用数据/目录搬家：复制 → 校验 → 删除源目录。
+
+    keep_link=True ：原位置建联接（透明链接），依赖原路径的软件照常可用；
+    keep_link=False：搬走后 C 盘原位置干干净净，什么都不留。
+    """
     res = {"ok": False, "stage": "", "detail": ""}
     if gp.is_junction(src):
         res["stage"], res["detail"] = "跳过", "已经是联接（之前搬过）"
@@ -269,24 +273,30 @@ def migrate_app_dir(src: Path, dst: Path, log=print) -> dict:
         res["stage"], res["detail"] = "重命名失败", f"{type(e).__name__}（可能有文件被占用，你的数据未被改动）"
         return res
 
-    log("    ③ 在原位置建目录联接（软件继续按老路径读写）…")
-    okj = make_junction(src, dst)
-    if not okj:
-        try:
-            os.rename(str(old), str(src))     # 联接建失败就立刻还原，不留下半吊子状态
-        except OSError:
-            pass
-        res["stage"], res["detail"] = "建联接失败", "已还原原目录，数据未动"
-        return res
+    if keep_link:
+        log("    ③ 在原位置建目录联接（软件继续按老路径读写）…")
+        okj = make_junction(src, dst)
+        if not okj:
+            try:
+                os.rename(str(old), str(src))     # 联接建失败就立刻还原，不留下半吊子状态
+            except OSError:
+                pass
+            res["stage"], res["detail"] = "建联接失败", "已还原原目录，数据未动"
+            return res
+        log("    ④ 清理 C 盘上的旧副本…")
+    else:
+        log("    ③ 按设置不在原位置留链接，直接清理 C 盘旧副本…")
 
-    log("    ④ 清理 C 盘上的旧副本…")
     left = 0
     try:
         shutil.rmtree(str(old), ignore_errors=True)
         left = 1 if old.exists() else 0
     except Exception:
         left = 1
-    res.update({"ok": True, "stage": "完成", "detail": ("有残留待你手动删除" if left else "旧副本已清理"),
+    res.update({"ok": True, "stage": "完成",
+                "detail": ("有残留待你手动删除" if left else
+                           ("旧副本已清理，原位置留有链接" if keep_link
+                            else "C 盘原位置已清空，不再保留")),
                 "size": src_size, "files": src_cnt})
     return res
 

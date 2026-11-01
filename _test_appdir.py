@@ -163,8 +163,8 @@ ck("默认配置的监控目录属于当前用户",
    all(p.lower().startswith(str(home).lower())
        for p in c_disk_guard.DEFAULT_CONFIG["监控目录"].values()),
    str(c_disk_guard.DEFAULT_CONFIG["监控目录"]))
-ck("默认全盘监控根属于当前用户",
-   c_disk_guard.DEFAULT_CONFIG["全盘监控根"][0].lower() == str(home).lower(),
+ck("默认全盘监控根为 C 盘根（全盘拦截）",
+   [r.lower() for r in c_disk_guard.DEFAULT_CONFIG["全盘监控根"]] == ["c:\\"],
    str(c_disk_guard.DEFAULT_CONFIG["全盘监控根"]))
 
 print()
