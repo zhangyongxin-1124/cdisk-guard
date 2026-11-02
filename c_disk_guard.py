@@ -65,6 +65,7 @@ import guard_growth
 import guard_quarantine
 import guard_wizard
 import guard_dashboard
+import guard_policy              # v6.14 可选监控盘 + 拦截白名单
 
 # ============================================================
 # 路径与配置
@@ -94,6 +95,21 @@ DEFAULT_CONFIG = {
     # 根本不会触发询问。现在直接监听 C:\ 根，配合排除关键词滤掉系统噪音。
     "全盘拦截": True,
     "全盘监控根": ["C:\\"],
+    # ---- v6.14：可选监控盘 + 拦截白名单 ----
+    # 空列表 = 仅监控系统盘（与旧版本完全一致）；设置页勾选后写成 ["C","D",...]
+    "监控盘": [],
+    # U 盘插入自动纳入监控、拔出自动摘除监听
+    "监控可移动盘": False,
+    # 这些目录 / 路径片段下的写入不询问（用户自己填）
+    "拦截白名单": [],
+    # 由这些进程写入时不询问（进程名，如 OneDrive.exe）
+    "白名单进程": [],
+    # 落盘后多久判定「写完了」（秒）。越短越接近「秒级迁移」；
+    # 不做内核驱动：内核过滤需要 EV 签名 + WHQL + 64 位兼容 + 系统异常处理，
+    # 稳定性代价太高，落盘后秒级检测 + 询问/迁移才是本软件的取舍。
+    "落盘稳定秒": 1.0,
+    # 命中「软件存储限制」规则时，落盘稳定后直接搬到上次选过的盘，不再弹窗
+    "落盘后秒级迁移": False,
     # 这些路径下的写入不打扰（系统/缓存/临时/软件自动生成，问也问不完）
     "排除路径关键词": [
         "\\windows\\",
@@ -702,6 +718,12 @@ class Guard:
         self.exclude_kw = [k.lower() for k in self.config.get("排除路径关键词", [])]
         self.ignore_exts = {e.lower() for e in self.config.get("忽略扩展名", [])}
 
+        # ---- v6.14：可选监控盘 + 白名单 ----
+        self.policy = guard_policy.Policy(self.config)
+        self._watched = {}                  # root -> TreeWatcher，用于增量启停
+        self.active_roots = set(self.config.get("全盘监控根") or [])
+        self.last_watch_refresh = 0.0
+
         # ---- 用户根目录新文件夹拦截（v5.1）----
         self.root_known = self._load_root_known()   # 已登记的根目录文件夹名
         self.root_skip = {}                         # "稍后再问" 的冷却：name -> 下次提醒时间
@@ -732,15 +754,20 @@ class Guard:
         except Exception:
             pass
 
-        # 监控范围升级（v6.11 加固）：老版本只监听用户目录（C:\Users\<用户>），
-        # 把文件复制/移动到 C 盘根目录或其他位置不会触发询问。
-        # 统一升级为监听「系统盘根目录」（用 %SystemDrive% 动态取，任何电脑都对），
-        # 不再信配置里写死的值——哪怕配置被改坏/从别的电脑带过来，这里都会纠正。
-        _sys_root = (os.environ.get("SystemDrive") or "C:").rstrip("\\") + "\\"
-        if list(cfg.get("全盘监控根") or []) != [_sys_root]:
-            cfg["全盘监控根"] = [_sys_root]
-            need_write = True
+        # 监控范围（v6.14）：由 guard_policy 按用户勾选的「监控盘」生成。
+        # v6.11 的加固仍然保留 —— 配置被改坏 / 从别的电脑带过来时，
+        # sanitize_drives 会剔除本机不存在的盘符，一个都不剩就回落系统盘，
+        # 绝不让拦截落在一个不存在的目录上而彻底失效。
         # 注：全盘拦截开关（全盘拦截: true/false）尊重用户在设置页的选择，不在此强制。
+        try:
+            if guard_policy.merge_defaults(cfg):
+                need_write = True
+            want_roots = guard_policy.roots(cfg)
+        except Exception:
+            want_roots = [(os.environ.get("SystemDrive") or "C:").rstrip("\\") + "\\"]
+        if list(cfg.get("全盘监控根") or []) != want_roots:
+            cfg["全盘监控根"] = want_roots
+            need_write = True
         kws = list(cfg.get("排除路径关键词") or [])
         miss = [k for k in DEFAULT_CONFIG["排除路径关键词"] if k not in kws]
         if miss:
@@ -834,6 +861,12 @@ class Guard:
 
     def is_excluded(self, path: str) -> bool:
         pl = path.lower()
+        # v6.14：用户白名单优先 —— 命中即不打扰（只做减法，不动文件）
+        try:
+            if self.policy.is_whitelisted(path):
+                return True
+        except Exception:
+            pass
         for kw in self.exclude_kw:
             if kw in pl:
                 return True
@@ -1663,18 +1696,59 @@ class Guard:
     # 五、事件处理
     # ========================================================
     def start_watchers(self):
-        roots = []
-        if self.config.get("全盘拦截", True):
-            roots = [r for r in self.config.get("全盘监控根", []) if os.path.isdir(r)]
-        for r in roots:
+        """启动当前策略下尚未启动的监听；可重复调用（增量，不重复建线程）。"""
+        return self.refresh_watchers(initial=True)
+
+    def refresh_watchers(self, initial=False):
+        """v6.14：按最新「监控盘」策略增删监听。
+
+        · 设置页改了勾选 → 下次刷新（≤15 秒）生效，无需重启程序；
+        · U 盘插入 → 自动加监听；拔出 → 目录消失，监听线程自行结束并被清理；
+        · 取消勾选某盘 → 不硬杀线程（Windows 句柄不适合强杀），
+          而是从 active_roots 摘掉，consume_events 直接丢弃该盘事件。
+        """
+        if not self.config.get("全盘拦截", True):
+            self.active_roots = set()
+            return []
+        try:
+            want = guard_policy.roots(self.config)
+        except Exception:
+            want = list(self.config.get("全盘监控根") or [])
+        if self.config.get("全盘监控根") != want:
+            self.config["全盘监控根"] = want      # 只同步内存，设置页保存时再落盘
+        self.active_roots = set(want)
+
+        # 清理已结束的 watcher（U 盘拔出后 ReadDirectoryChangesW 会失败退出）
+        for root, w in list(self._watched.items()):
+            if not w.is_alive():
+                self._watched.pop(root, None)
+                try:
+                    self.watchers.remove(w)
+                except ValueError:
+                    pass
+
+        for r in want:
+            if r in self._watched or not os.path.isdir(r):
+                continue
             w = TreeWatcher(r, self.q, self.stop_evt, filter_fn=self.is_excluded)
             w.start()
             self.watchers.append(w)
-        if not roots and self.config.get("全盘拦截", True):
-            # 配置里写了监控根但目录不存在：拦截等于没有，必须留下记录便于排查
-            self.log("监听", Path("C:\\"), 0,
-                     "未启动-监控根目录不存在: " + "; ".join(self.config.get("全盘监控根", [])))
-        return roots
+            self._watched[r] = w
+        if initial and not want:
+            self.log("监听", Path(guard_policy.system_root()), 0,
+                     "未启动-监控根目录不存在: " + "; ".join(
+                         self.config.get("全盘监控根", [])))
+        return list(want)
+
+    def _path_in_scope(self, path: str) -> bool:
+        """只处理当前勾选盘上的事件（取消勾选 / U 盘拔出后立即生效）。"""
+        if not self.active_roots:
+            return False
+        try:
+            drive = os.path.splitdrive(str(path))[0].upper().rstrip("\\/") + "\\"
+            return drive in {r.upper() for r in self.active_roots}
+        except Exception:
+            return True
 
     def consume_events(self, now):
         drained = 0
@@ -1684,6 +1758,8 @@ class Guard:
             except queue.Empty:
                 break
             drained += 1
+            if not self._path_in_scope(path):
+                continue
             if self.is_excluded(path):
                 continue
             p = Path(path)
@@ -1708,8 +1784,51 @@ class Guard:
                     continue
                 self.pending_removed.setdefault(path, evt_time)
 
+    def _auto_relocate(self, p: Path, size: int) -> bool:
+        """v6.14「落盘后秒级迁移」：命中软件限制规则且用户为该软件指定过
+        目标盘时，落盘稳定后直接搬走，不再弹窗。
+
+        安全约束：
+          · 没命中规则、没指定目标盘、目标目录不存在 → 一律返回 False，照常询问；
+          · 目标盘与文件所在盘相同 → 不搬（等于没搬）；
+          · 搬移走的是已有的 move_file（先复制校验后删源，失败保留原文件）。
+        """
+        try:
+            import guard_rules
+            hay = str(p).lower()
+            rule = None
+            for r in guard_rules.rules.rules:
+                if not r.get("enabled", True):
+                    continue
+                if any(k and k in hay for k in r.get("keywords", [])):
+                    rule = r
+                    break
+            if not rule:
+                return False
+            targets = self.config.get("转移目标") or {}
+            dest = str(targets.get(rule.get("name")) or targets.get("default") or "")
+            if not dest or not os.path.isdir(dest):
+                return False
+            if os.path.splitdrive(dest)[0].lower() == \
+                    os.path.splitdrive(str(p))[0].lower():
+                return False
+            moved = self.move_file(p, dest)
+            if not moved:
+                return False
+            self.handled[str(p)] = (size, time.time())
+            self.log("秒级迁移", p.name, size,
+                     f"命中「{rule.get('name', '')}」自动搬到 {Path(dest).anchor}", moved)
+            return True
+        except Exception:
+            return False
+
     def flush_writes(self, now):
         """把稳定的新文件按"重点目录立即问 / 其他目录累计问"处理。"""
+        # v6.14：落盘稳定判定可由配置调整，默认 1.0 秒（秒级响应）
+        try:
+            stable_s = max(0.3, float(self.config.get("落盘稳定秒", 1.0)))
+        except (TypeError, ValueError):
+            stable_s = 1.5
         focus_ready, other_ready = [], []
         for path, rec in list(self.pending_writes.items()):
             p = Path(path)
@@ -1728,10 +1847,14 @@ class Guard:
             if rec["stable"] == 0.0:
                 rec["stable"] = now
                 continue
-            if now - rec["stable"] < 1.5:      # 1.5 秒内大小没变 = 写完了
+            if now - rec["stable"] < stable_s:   # 这段时间内大小没变 = 写完了
                 continue
             self.pending_writes.pop(path, None)
             if self._is_handled(p, size):
+                continue
+            # v6.14「落盘后秒级迁移」：命中软件限制规则时不弹窗，直接搬到
+            # 用户上次为这个软件选过的盘（没选过就照常询问，绝不擅自决定）。
+            if self.config.get("落盘后秒级迁移") and self._auto_relocate(p, size):
                 continue
             if self._in_agg_dirs(p):
                 # 下载这类目录走"聚合"：攒够一定量一次性问，不逐个文件弹窗
@@ -2009,6 +2132,14 @@ class Guard:
                 if now - self.last_poll > float(self.config.get("轮询间隔秒", 20)):
                     self.last_poll = now
                     self.poll_fallback()
+
+                # v6.14：每 15 秒重算一次监控盘（U 盘插拔 / 设置页改勾选都即时生效）
+                if now - self.last_watch_refresh > 15:
+                    self.last_watch_refresh = now
+                    try:
+                        self.refresh_watchers()
+                    except Exception:
+                        pass
 
                 self.maybe_space_alert()
             except KeyboardInterrupt:

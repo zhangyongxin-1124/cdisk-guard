@@ -22,6 +22,7 @@ MANUAL = ROOT / "使用说明_桌面版.txt"
 GUI = ROOT / "guard_gui.py"
 FASTSCAN = ROOT / "guard_fastscan.py"
 CLEANER = ROOT / "guard_cleaner.py"
+ENGINE = ROOT / "c_disk_guard.py"
 SPEC = ROOT / "CDiskGuardGUI.spec"
 GITIGNORE = ROOT / ".gitignore"
 PORTABLE_MANUAL = ROOT / "便携版" / "使用说明_桌面版.txt"
@@ -72,6 +73,7 @@ def main() -> int:
     c = Checker()
     s_readme, s_manual = read(README), read(MANUAL)
     s_gui, s_fast, s_clean = read(GUI), read(FASTSCAN), read(CLEANER)
+    s_engine = read(ENGINE)
     s_spec, s_ignore, s_portable = read(SPEC), read(GITIGNORE), read(PORTABLE_MANUAL)
 
     # ---------- 1. 版本号 ----------
@@ -180,11 +182,16 @@ def main() -> int:
     c.ck(not bad_prefix, "内部小节编号与所属章节号一致",
          "；".join(bad_prefix[:4]))
 
-    # ---------- 8. 交叉引用指向正确章节 ----------
+    # ---------- 8. 交叉引用指向真实存在的章节 ----------
     refs = re.findall(r"详见第([一二三四五六七八九十]+)章", s_manual)
+    title_by_no = dict(chapters)
+    bad_refs = [r for r in refs if r not in title_by_no]
     log_no = next((num for num, title in chapters if "日志自动清理" in title), "")
-    c.ck(bool(refs) and all(r == log_no for r in refs),
-         "「详见第X章」指向日志自动清理所在章节",
+    c.ck(bool(refs) and not bad_refs,
+         "「详见第X章」都指向真实存在的章节",
+         f"悬空引用：{'、'.join(bad_refs)}；全部引用 {refs}")
+    c.ck(log_no in refs,
+         "日志自动清理章节被交叉引用",
          f"引用 {refs}，日志自动清理实际在「{log_no}」章")
 
     # ---------- 9. 格式与过时表述 ----------
@@ -220,6 +227,27 @@ def main() -> int:
     if PORTABLE_MANUAL.exists():
         c.ck(s_portable == s_manual, "便携版使用说明与主文档完全一致",
              "便携版/使用说明_桌面版.txt 未同步，请重新拷贝")
+
+    # ---------- 11b. v6.14 新功能：代码与两份文档同时存在 ----------
+    for mod in ("guard_migrate", "guard_attribution", "guard_policy"):
+        c.ck(mod in s_spec, f"spec hiddenimports 含 {mod}",
+             "新模块没进打包配置，exe 里会缺功能")
+        c.ck(f"`{mod}.py`" in s_readme, f"README 源码结构表含 {mod}.py")
+    for key in ("监控盘", "拦截白名单", "白名单进程", "落盘稳定秒",
+                "落盘后秒级迁移"):
+        c.ck(f'"{key}"' in s_engine, f"引擎默认配置含「{key}」",
+             "配置键改名后需同步文档与校验规则")
+    for label, txt in (("README", s_readme), ("使用说明", s_manual)):
+        for kw in ("软件迁移", "监控盘选择", "拦截白名单", "模拟运行",
+                   "风险等级", "数字签名", "junction"):
+            c.ck(kw in txt, f"{label} 提到「{kw}」",
+                 "v6.14 新功能缺说明，文档与代码不一致")
+        c.ck("分步扫描" in txt, f"{label} 提到「分步扫描」")
+    c.ck("progressive_scan" in s_fast and "shallow_stats" in s_fast,
+         "guard_fastscan 含分步扫描引擎",
+         "函数改名后需同步文档与校验规则")
+    c.ck("def preview(" in s_clean and "dry_run" in s_clean,
+         "guard_cleaner 含模拟运行（dry-run）")
 
     # ---------- 12. 发布包内文档（可选）----------
     if args.zip:

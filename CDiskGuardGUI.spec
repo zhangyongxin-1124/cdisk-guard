@@ -10,6 +10,7 @@ a = Analysis(
                    'guard_dashboard', 'guard_growth', 'guard_quarantine',
                    'guard_paths', 'guard_wizard', 'guard_bridge', 'guard_theme',
                    'guard_legacy', 'guard_appdir', 'guard_fastscan',
+                   'guard_migrate', 'guard_attribution', 'guard_policy',
                    'PySide6.QtSvg'],
     hookspath=[],
     hooksconfig={},

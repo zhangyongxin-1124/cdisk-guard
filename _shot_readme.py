@@ -152,7 +152,30 @@ def main():
         win._fill_today(DEMO_ITEMS)
         app.processEvents()
 
-        for key in ["overview", "today", "clean", "guardlog", "quarantine", "settings", "legacy"]:
+        # 软件迁移页：注入演示行（避免切页时触发真实软件扫描）
+        from PySide6.QtWidgets import QTreeWidgetItem
+        for nm, path, sz, src in [
+                ("Steam", "C:\\Program Files (x86)\\Steam", "18.6 GB", "安装目录"),
+                ("微信", "C:\\Program Files (x86)\\Tencent\\WeChat", "1.2 GB", "已安装"),
+                ("剪映专业版", "C:\\Users\\演示\\AppData\\Local\\JianyingPro",
+                 "860 MB", "软件数据目录")]:
+            win.mig_tree.addTopLevelItem(QTreeWidgetItem([nm, path, sz, src]))
+        win.mig_plan_view.setPlainText(
+            "【Steam】18.6 GB / 23641 个文件\n"
+            "风险等级：中\n"
+            "  · 有 2 个快捷方式指向旧目录（可自动更新）\n"
+            "  · 注册表里有 3 处路径引用（可自动替换）\n"
+            "  · 没有检测到 Windows 服务\n\n"
+            "将执行：\n"
+            "  ① 复制 23641 个文件（18.6 GB）到 D:\\C盘守卫迁移\\Steam\n"
+            "  ② 逐项校验文件数量一致后才动源目录\n"
+            "  ③ 更新 2 个快捷方式的目标 / 起始位置\n"
+            "  ④ 替换 3 处注册表路径（先备份，可还原）\n"
+            "  ⑥ 原位置留 junction 透明链接，软件按老路径照常读写")
+        win.lbl_mig_state.setText("风险等级：中。这只是模拟运行，尚未改动任何文件。")
+
+        for key in ["overview", "today", "clean", "guardlog", "quarantine",
+                    "settings", "legacy", "migrate"]:
             win._goto_page(key)
             if key == "legacy":       # 明确重刷，确保读到演示快照
                 win._fill_legacy_overview()

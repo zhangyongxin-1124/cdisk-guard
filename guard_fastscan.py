@@ -222,6 +222,108 @@ def quick_space(root: str):
         return 0, 0, 0
 
 
+# ============================================================
+# v6.14：分步扫描（先统计大目录，再展开占用高的分支）
+# ============================================================
+
+def shallow_stats(path, depth: int = 2, cancel_evt=None,
+                  stat_dirs: bool = True) -> tuple:
+    """浅层统计：只遍历前 depth 层，快速估出一个目录有多大。
+
+    纯迭代、不启线程池 —— 阶段一按顶层目录挨个跑也不吃 CPU。
+    返回 (总字节, 文件数)。
+    """
+    total = [0]
+    cnt = [0]
+    stack = [(str(path), 0)]
+    while stack:
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
+        cur, level = stack.pop()
+        for e in iter_entries(cur, cancel_evt, stat_dirs):
+            if e.is_dir:
+                if level + 1 < depth:
+                    stack.append((e.path, level + 1))
+            else:
+                total[0] += e.size
+                cnt[0] += 1
+    return total[0], cnt[0]
+
+
+def progressive_scan(root, root_ctx, descend, visit, *,
+                     phase_cb=None, progress_cb=None, cancel_evt=None,
+                     workers=None, stat_dirs=True, shallow_depth=2,
+                     top_n=0, progress_every=200, branch_ctx_fn=None,
+                     branch_filter=None):
+    """两阶段扫描一个盘（或一个大目录）。
+
+    阶段 1「统计大目录」：只读顶层 + 浅层 2 层，给每个一级子目录估出体积，
+      每算完一个就回调 phase_cb(1, i, n, path) —— 界面立刻有进度。
+    阶段 2「展开高占用分支」：按估算体积从大到小，**一次只展开一个分支**
+      （不再把所有分支同时丢进线程池），磁盘压力平稳、进度持续可见。
+      每展开完一个回调 phase_cb(2, i, n, path)。
+
+    top_n > 0 时只展开前 N 个最占空间的分支（快速预览用）；0 = 全展开。
+    返回 {"summaries": [...], "phase1_s", "phase2_s", "elapsed", "branches"}
+    """
+    t0 = time.time()
+    root = str(root)
+    workers = workers or default_workers()
+
+    # ---- 阶段 1：顶层概览 ----
+    p1 = time.time()
+    try:
+        top_entries = list(iter_entries(root, cancel_evt, stat_dirs))
+    except Exception:
+        top_entries = []
+    summaries = []
+    dirs = [e for e in top_entries
+            if e.is_dir and (branch_filter(e) if branch_filter else True)]
+    for i, e in enumerate(dirs, 1):
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
+        size, cnt = shallow_stats(e.path, shallow_depth, cancel_evt, stat_dirs)
+        summaries.append({"path": e.path, "name": e.name,
+                          "size": size, "files": cnt})
+        if phase_cb:
+            try:
+                phase_cb(1, i, len(dirs), e.path)
+            except Exception:
+                pass
+    # 顶层条目本身照常 visit（与 parallel_scan 的行为保持一致）
+    for e in top_entries:
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
+        visit(e, root, 0, root_ctx)      # 阶段一单线程，无需加锁
+    summaries.sort(key=lambda x: -x["size"])
+    phase1_s = time.time() - p1
+
+    # ---- 阶段 2：按占用降序逐个展开 ----
+    p2 = time.time()
+    selected = summaries[:top_n] if top_n and top_n > 0 else summaries
+    entry_by_path = {e.path: e for e in top_entries}
+    for i, s in enumerate(selected, 1):
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
+        # 调用方按自己的聚合规则为这个分支生成正确的上下文，
+        # 保证「分步扫描」与一次性扫描的统计口径完全一致。
+        bctx = (branch_ctx_fn(entry_by_path[s["path"]])
+                if branch_ctx_fn and s["path"] in entry_by_path else root_ctx)
+        parallel_scan([(s["path"], 1, bctx)], descend, visit,
+                      workers=workers, cancel_evt=cancel_evt,
+                      progress_cb=progress_cb, progress_every=progress_every,
+                      stat_dirs=stat_dirs, expand=1)
+        if phase_cb:
+            try:
+                phase_cb(2, i, len(selected), s["path"])
+            except Exception:
+                pass
+    phase2_s = time.time() - p2
+    return {"summaries": summaries, "phase1_s": phase1_s,
+            "phase2_s": phase2_s, "elapsed": time.time() - t0,
+            "branches": len(selected), "workers": workers}
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="磁盘扫描速度自检")

@@ -103,8 +103,29 @@ _RE_PROGFILES = re.compile(r"program files( \(x86\))?\\([^\\]+)")
 _RE_PROGDATA = re.compile(r"programdata\\([^\\]+)")
 
 
+_ATTR_STORE = None
+
+
+def _user_overrides():
+    """v6.14：懒加载用户手动修正表（只在第一次调用时 import 一次）。"""
+    global _ATTR_STORE
+    if _ATTR_STORE is None:
+        try:
+            import guard_attribution
+            _ATTR_STORE = guard_attribution.overrides
+        except Exception:
+            _ATTR_STORE = False
+    return _ATTR_STORE or None
+
+
 def guess_app(path: str) -> str:
     pl = path.lower()
+    # v6.14：用户手动修正的归属优先级最高（内存查询，不拖慢几十万文件的扫描）
+    store = _user_overrides()
+    if store is not None:
+        fixed = store.resolve(path)
+        if fixed:
+            return fixed
     if USE_BUILTIN_SIGNATURES:
         for keys, name in APP_SIGNATURES:
             for k in keys:
@@ -387,11 +408,15 @@ class TodayScanner:
                 return True
         return False
 
-    def scan(self, progress_cb=None, cancel_evt=None) -> dict:
+    def scan(self, progress_cb=None, cancel_evt=None, deep=False) -> dict:
         """返回 {"items": [...], "total_size": int, "count": int, "ts": float}
 
         item: {"path", "name", "size", "mtime", "app", "is_dir"}
         只统计"今天 0 点后创建/修改过"的文件；目录本身也列出（便于整体搬移）。
+
+        v6.14：deep=True 时对前 20 个来源目录补做数字签名 / 进程关联核验，
+        结果放在返回值的 "attribution" 里。这是昂贵操作，默认关闭，
+        由「设置 → 深度来源识别」控制；单条详情随时可在列表里右键查看。
         """
         day0 = datetime.datetime.combine(datetime.date.today(),
                                          datetime.time.min).timestamp()
@@ -433,7 +458,36 @@ class TodayScanner:
             progress_cb=(lambda n, cur: progress_cb(len(items), cur))
                         if progress_cb else None,
             progress_every=200, stat_dirs=True)
-        return self._finalize(items)
+        result = self._finalize(items)
+        if deep:
+            result["attribution"] = self._deep_attribution(items, progress_cb)
+        return result
+
+    def _deep_attribution(self, items, progress_cb=None, max_dirs: int = 20) -> dict:
+        """对前 N 个来源目录做签名 / 进程核验（带缓存，失败不影响扫描结果）。"""
+        dirs, seen = [], set()
+        for it in items:
+            if it.get("is_dir"):
+                continue
+            d = os.path.dirname(it["path"])
+            key = d.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dirs.append(d)
+            if len(dirs) >= max_dirs:
+                break
+        try:
+            import guard_attribution as ga
+            procs = ga.running_processes()
+            out = {}
+            for i, d in enumerate(dirs, 1):
+                out[d] = ga.enrich(d, procs=procs)
+                if progress_cb:
+                    progress_cb(len(items), f"来源核验 {i}/{len(dirs)}")
+            return out
+        except Exception:
+            return {}
 
     # ---- 时间辅助：新增时间 = 创建时间（今天创建）否则修改时间 ----
     @staticmethod

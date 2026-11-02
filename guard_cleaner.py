@@ -44,6 +44,11 @@ DEFAULT_CFG = {
     "清崩溃转储": True,       # 是否清 .dmp 崩溃转储
     "清临时文件": True,       # 是否清 Temp 里的旧文件
     "扫描根目录": [],         # 留空 = 用默认（Temp + AppData + Windows\Temp）
+    # ---- v6.14：更细的自动清理规则 ----
+    "允许文件类型": [],       # 留空 = 三类都清；填了只清这些扩展名（如 [".log", ".dmp"]）
+    "目录白名单": [],         # 这些目录（及其子目录）永不清理
+    "单次上限MB": 0,          # 0 = 不限；单次最多累计清这么多，避免连续处理海量小文件
+    "模拟运行": False,        # True = 只列清单和预计释放量，确认前绝不删除
 }
 
 # ============================================================
@@ -118,6 +123,16 @@ def _is_excluded(path_l: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _dir_whitelisted(path_l: str, cfg) -> bool:
+    """v6.14：用户填的目录白名单（目录前缀或路径片段），命中永不清理。"""
+    wl = [str(x).strip().lower().replace("/", "\\").rstrip("\\")
+          for x in (cfg.get("目录白名单") or []) if str(x).strip()]
+    if not wl:
+        return False
+    pl = path_l.replace("/", "\\")
+    return any(pl.startswith(w) or w in pl for w in wl)
 
 
 def is_temp_root(p: str) -> bool:
@@ -217,6 +232,15 @@ def scan(cfg=None, roots=None, budget_s=25.0, max_files=300000,
     big_mb = max(1, int(cfg.get("超大日志MB", 50)))
     do_crash = bool(cfg.get("清崩溃转储", True))
     do_temp = bool(cfg.get("清临时文件", True))
+    # v6.14：文件类型过滤 / 单次累计上限
+    allow_exts = {str(x).strip().lower() for x in
+                  (cfg.get("允许文件类型") or []) if str(x).strip()}
+    try:
+        cap_bytes = max(0, int(cfg.get("单次上限MB", 0) or 0)) * MB
+    except (TypeError, ValueError):
+        cap_bytes = 0
+    dir_wl = [str(x).strip().lower().replace("/", "\\").rstrip("\\")
+              for x in (cfg.get("目录白名单") or []) if str(x).strip()]
 
     now = time.time()
     temp_prefixes = tuple(r.lower().rstrip("\\/") for r in roots if is_temp_root(r))
@@ -260,12 +284,16 @@ def scan(cfg=None, roots=None, budget_s=25.0, max_files=300000,
         have.add(pl)
         if _is_excluded(pl):
             return
+        if dir_wl and any(pl.startswith(w) or w in pl for w in dir_wl):
+            return
         cat = classify(p, temp_prefixes)
         if not cat:
             return
         if cat == "崩溃转储" and not do_crash:
             return
         if cat == "临时文件" and not do_temp:
+            return
+        if allow_exts and os.path.splitext(p)[1].lower() not in allow_exts:
             return
 
         mtime = entry.mtime
@@ -285,6 +313,13 @@ def scan(cfg=None, roots=None, budget_s=25.0, max_files=300000,
         else:
             return
 
+        # v6.14：单次累计大小上限 —— 到顶就停，不连续处理海量小文件
+        if cap_bytes and size > cap_bytes:
+            return                      # 单个就超预算，跳过它继续找小的
+        if cap_bytes and total + size > cap_bytes:
+            truncated = True
+            cancel.set()
+            return
         items.append({
             "path": p,
             "size": size,
@@ -350,12 +385,22 @@ def aggregate(items, max_rows=300):
 # 清理
 # ============================================================
 
-def clean(items):
+def clean(items, dry_run=False, max_bytes=0):
     """删除给定文件（永久删除，不再占空间）。
 
-    返回 dict：ok[(path,size)] / fail[(path,err)] / freed
+    v6.14：
+      · dry_run=True —— 只返回「准备删除的清单 + 预计释放量」，一个字节都不删；
+      · max_bytes>0  —— 单次累计删除量到顶即停，避免连续处理海量小文件。
+
+    返回 dict：ok[(path,size)] / fail[(path,err)] / freed /
+              dry_run / planned[{path,size,reason}] / stopped_by_cap
     """
-    ok, fail, freed = [], [], 0
+    ok, fail, freed, planned = [], [], 0, []
+    stopped = False
+    try:
+        cap = max(0, int(max_bytes or 0))
+    except (TypeError, ValueError):
+        cap = 0
     for it in items:
         p = it["path"] if isinstance(it, dict) else str(it)
         try:
@@ -365,6 +410,19 @@ def clean(items):
                 size = it["size"]
             except Exception:
                 size = 0
+        if cap and size > cap:
+            continue                    # 单个就超预算，跳过它继续找小的
+        if cap and freed + size > cap:
+            stopped = True
+            break
+        if dry_run:
+            planned.append({
+                "path": p, "size": size,
+                "reason": (it.get("reason", "") if isinstance(it, dict) else ""),
+                "cat": (it.get("cat", "") if isinstance(it, dict) else ""),
+            })
+            freed += size
+            continue
         try:
             os.remove(p)
             ok.append((p, size))
@@ -382,7 +440,30 @@ def clean(items):
                 fail.append((p, str(e2) or str(e1)))
         except Exception as e:
             fail.append((p, str(e)))
-    return {"ok": ok, "fail": fail, "freed": freed}
+    return {"ok": ok, "fail": fail, "freed": freed,
+            "dry_run": bool(dry_run), "planned": planned,
+            "stopped_by_cap": stopped}
+
+
+def preview(items, limit=500) -> dict:
+    """v6.14 模拟运行：列出准备删除的文件与预计释放量（只读，不删任何东西）。"""
+    plan = clean(items, dry_run=True)
+    rows = plan["planned"]
+    by_cat = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        c = it.get("cat", "其他")
+        by_cat[c] = by_cat.get(c, 0) + int(it.get("size", 0))
+    return {
+        "files": rows[:limit],
+        "count": len(rows),
+        "total": plan["freed"],
+        "shown": min(limit, len(rows)),
+        "by_cat": by_cat,
+        "skipped_active": sum(1 for it in items
+                              if isinstance(it, dict) and it.get("active")),
+    }
 
 
 # ============================================================

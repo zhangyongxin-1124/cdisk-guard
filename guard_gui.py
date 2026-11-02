@@ -21,6 +21,7 @@ import os
 import sys
 import csv
 import json
+import re
 import time
 import shutil
 import subprocess
@@ -39,7 +40,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QDialog, QListWidget, QListWidgetItem, QFileDialog,
     QSystemTrayIcon, QMenu, QHeaderView, QAbstractItemView, QStyle,
     QGridLayout, QLineEdit, QStackedWidget, QFrame, QScrollArea, QSizePolicy,
-    QDateEdit, QTableWidget, QTableWidgetItem,
+    QDateEdit, QTableWidget, QTableWidgetItem, QTextEdit, QInputDialog,
 )
 
 from guard_appdir import APP_DIR        # 统一数据目录（自动适配本机）
@@ -69,11 +70,14 @@ import guard_drives
 import guard_rules
 import guard_cleaner
 import guard_legacy
+import guard_migrate          # v6.14 软件迁移向导
+import guard_attribution      # v6.14 来源归因增强
+import guard_policy           # v6.14 可选监控盘 + 拦截白名单
 import guard_theme as GT
 from guard_bridge import bridge, IDYES, IDNO, IDCANCEL, IDOK
 
 APP_NAME = "C盘守卫"
-APP_VERSION = "6.13"
+APP_VERSION = "6.14"
 ICON_PATH = _resource("guard_icon.ico")
 MB = engine  # 常量速记
 
@@ -1043,6 +1047,13 @@ class MainWindow(QMainWindow):
     clean_done = Signal(int, int, int, str)       # freed, ok_count, fail_count, msgs
     legacy_progress = Signal(str)                 # 存量盘点进度
     legacy_done = Signal(dict)                    # 存量盘点完成
+    # ---- v6.14 软件迁移向导 / 来源归因（后台线程 → 主线程）----
+    migrate_apps_done = Signal(object)            # 可迁移软件清单
+    migrate_plan_done = Signal(object)            # 迁移计划 dict
+    migrate_apply_done = Signal(object)           # 执行结果 dict
+    migrate_rollback_done = Signal(object)        # 回滚结果 dict
+    migrate_progress = Signal(str)                # 进度文案
+    attr_detail_done = Signal(object)             # 来源详情 dict
 
     def __init__(self, guard: GuiGuard, minimized=False):
         super().__init__()
@@ -1107,6 +1118,7 @@ class MainWindow(QMainWindow):
             ("clean",      "日志清理", self._build_clean_tab()),
             ("guardlog",   "守卫记录", self._build_log_tab()),
             ("quarantine", "隔离区",   self._build_quar_tab()),
+            ("migrate",    "软件迁移", self._build_migrate_tab()),
             ("settings",   "设置",     self._build_settings_tab()),
         )
         for i, (key, title, page_w) in enumerate(pages):
@@ -1169,6 +1181,12 @@ class MainWindow(QMainWindow):
         self.clean_done.connect(self._on_clean_done)
         self.legacy_progress.connect(self._on_legacy_progress)
         self.legacy_done.connect(self._on_legacy_done)
+        self.migrate_apps_done.connect(self._on_migrate_apps)
+        self.migrate_plan_done.connect(self._on_migrate_plan)
+        self.migrate_apply_done.connect(self._on_migrate_apply)
+        self.migrate_rollback_done.connect(self._on_migrate_rollback)
+        self.migrate_progress.connect(self._on_migrate_progress)
+        self.attr_detail_done.connect(self._on_attr_detail)
 
         # 枚举本机磁盘，初始化"检测位置"下拉
         self._reload_drive_combo()
@@ -1620,6 +1638,11 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(idx)
         for k, b in self.nav.items():
             b.setChecked(k == key)
+        # v6.14：首次进入「软件迁移」页时自动加载软件列表
+        if key == "migrate" and getattr(self, "mig_tree", None) is not None \
+                and self.mig_tree.topLevelItemCount() == 0 \
+                and not getattr(self, "_mig_loading", False):
+            self._mig_refresh_apps()
 
     def _goto_drive(self, letter):
         """概况页按钮：切到今日新增页并把检测位置切到指定盘。"""
@@ -2483,9 +2506,10 @@ class MainWindow(QMainWindow):
         def work():
             t0 = time.time()
             try:
+                _deep = bool(self.guard.config.get("深度来源识别", False))
                 data = self.scanner.scan(progress_cb=lambda n, cur:
                                          self.scan_progress.emit(n, cur),
-                                         cancel_evt=cancel)
+                                         cancel_evt=cancel, deep=_deep)
             except Exception as e:
                 data = {"items": [], "total_size": 0, "count": 0,
                         "err": str(e)}
@@ -2710,11 +2734,70 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         act_limit = menu.addAction(f"🚫 禁止「{app or os.path.basename(path)}」存到 C 盘")
         act_open = menu.addAction("📂 打开所在位置")
+        menu.addSeparator()
+        act_detail = menu.addAction("🔍 查看来源详情（签名 / 进程）")
+        act_fix = menu.addAction("✏️ 修正来源应用…")
         act = menu.exec(self.today_tree.viewport().mapToGlobal(pos))
         if act is act_limit:
             self._add_rule_from_item(app, path)
         elif act is act_open:
             self._open_item_location(item)
+        elif act is act_detail:
+            self._show_attr_detail(item)
+        elif act is act_fix:
+            self._fix_attribution(item)
+
+    # ---------- v6.14：来源归因核验与手动修正 ----------
+    def _show_attr_detail(self, item):
+        data = item.data(0, Qt.UserRole) or {}
+        path = data.get("path") or data.get("dir") or ""
+        if not path:
+            return
+        d = path if os.path.isdir(path) else os.path.dirname(path)
+        self.lbl_today_summary.setText("正在核验来源（数字签名 / 进程关联）…")
+
+        def work():
+            try:
+                info = guard_attribution.enrich(d)
+                info["app"] = guard_today.guess_app(path)
+                info["path"] = path
+            except Exception as e:
+                info = {"__error__": str(e), "dir": d}
+            self.attr_detail_done.emit(info)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_attr_detail(self, info):
+        if info.get("__error__"):
+            QMessageBox.information(self, APP_NAME,
+                                    "来源核验失败：" + str(info["__error__"]))
+            return
+        txt = (f"当前归因：{info.get('app', '')}\n"
+               f"文件：{info.get('path', '')}\n\n"
+               + guard_attribution.describe(info))
+        QMessageBox.information(self, "来源详情 — " + str(info.get("app", "")), txt)
+
+    def _fix_attribution(self, item):
+        data = item.data(0, Qt.UserRole) or {}
+        path = data.get("path") or data.get("dir") or ""
+        if not path:
+            QMessageBox.information(self, APP_NAME, "这一行没有可用的路径。")
+            return
+        cur = guard_today.guess_app(path)
+        kw = guard_attribution.suggest_keyword(path) or \
+            os.path.basename(os.path.normpath(path))
+        name, ok = QInputDialog.getText(
+            self, APP_NAME,
+            f"这个目录里的文件属于哪个软件？\n\n当前显示：{cur}\n"
+            f"识别关键词：{kw}\n（同目录下所有文件都会按你写的名字显示）")
+        if not ok or not str(name).strip():
+            return
+        guard_attribution.overrides.set(kw, str(name).strip())
+        QMessageBox.information(
+            self, APP_NAME,
+            f"已记下：包含「{kw}」的路径统一显示为「{str(name).strip()}」。\n"
+            "已自动重新扫描，列表马上更新。（可在设置里关闭深度识别）")
+        self.start_scan()
 
     def _add_rule_from_item(self, app, path):
         """用选中行的来源应用名 + 路径，快速建一条限制规则。"""
@@ -2974,11 +3057,16 @@ class MainWindow(QMainWindow):
         b_clean.setMinimumHeight(34)
         b_clean.setStyleSheet("background:#2f7d32; color:white; font-weight:bold;")
         b_clean.clicked.connect(self._clean_selected)
+        b_dry = QPushButton("🧪 模拟运行（先列清单）")
+        b_dry.setMinimumHeight(34)
+        b_dry.setToolTip("只读预览：列出准备删除的每个文件和预计释放量，"
+                         "你点确认之后才会真正删除")
+        b_dry.clicked.connect(self._simulate_clean)
         b_all = QPushButton("全选")
         b_all.clicked.connect(lambda: self._check_all_clean(True))
         b_none = QPushButton("全不选")
         b_none.clicked.connect(lambda: self._check_all_clean(False))
-        for b in (self.b_clean_scan, b_clean, b_all, b_none):
+        for b in (self.b_clean_scan, b_clean, b_dry, b_all, b_none):
             top.addWidget(b)
         top.addStretch(1)
         lay.addLayout(top)
@@ -3045,10 +3133,37 @@ class MainWindow(QMainWindow):
         gl.addWidget(self.cb_clean_crash, r + 1, 0, 1, 2)
         gl.addWidget(self.cb_clean_temp, r + 2, 0, 1, 2)
 
+        # ---- v6.14：模拟运行 + 文件类型 / 目录白名单 / 累计上限 ----
+        self.cb_clean_dry = QCheckBox("模拟运行（只列清单和预计释放量，确认前不删除）")
+        self.cb_clean_dry.setChecked(bool(cfg.get("模拟运行", False)))
+        gl.addWidget(self.cb_clean_dry, r + 3, 0, 1, 2)
+
+        self.le_clean_types = QLineEdit(
+            ", ".join(str(x) for x in (cfg.get("允许文件类型") or [])))
+        self.le_clean_types.setPlaceholderText("留空 = 三类都清；例：.log, .dmp")
+        self.le_clean_types.setToolTip("只清这些扩展名；留空则日志 / 崩溃转储 / 临时文件都清")
+        gl.addWidget(QLabel("只清这些类型（逗号分隔）"), r + 4, 0)
+        gl.addWidget(self.le_clean_types, r + 4, 1)
+
+        self.le_clean_wl = QLineEdit(
+            "; ".join(str(x) for x in (cfg.get("目录白名单") or [])))
+        self.le_clean_wl.setPlaceholderText("永不清理的目录，分号分隔")
+        self.le_clean_wl.setToolTip("这些目录及其子目录一律不碰，优先级最高")
+        gl.addWidget(QLabel("目录白名单（分号分隔）"), r + 5, 0)
+        gl.addWidget(self.le_clean_wl, r + 5, 1)
+
+        self.sp_clean_cap = QSpinBox()
+        self.sp_clean_cap.setRange(0, 100000)
+        self.sp_clean_cap.setValue(int(cfg.get("单次上限MB", 0) or 0))
+        self.sp_clean_cap.setToolTip(
+            "0 = 不限；单次累计清理量到顶就停，避免连续处理海量小文件")
+        gl.addWidget(QLabel("单次累计上限 MB（0=不限）"), r + 6, 0)
+        gl.addWidget(self.sp_clean_cap, r + 6, 1)
+
         b_save = QPushButton("💾 保存自动清理设置")
         b_save.setMinimumHeight(32)
         b_save.clicked.connect(self._save_clean_settings)
-        gl.addWidget(b_save, r + 3, 0, 1, 2)
+        gl.addWidget(b_save, r + 7, 0, 1, 2)
         lay.addWidget(g)
 
         st = guard_cleaner.load_state()
@@ -3099,7 +3214,8 @@ class MainWindow(QMainWindow):
         self._clean_scanning = False
         self.b_clean_scan.setEnabled(True)
         self.b_clean_scan.setText("🔍 立即扫描")
-        self.clean_rows = guard_cleaner.aggregate(res.get("items", []))
+        self._clean_last_items = res.get("items", []) or []
+        self.clean_rows = guard_cleaner.aggregate(self._clean_last_items)
         self._fill_clean(res)
 
     def _fill_clean(self, res):
@@ -3194,6 +3310,56 @@ class MainWindow(QMainWindow):
                     out.extend(g.get("items", []))
         return out
 
+    def _simulate_clean(self):
+        """v6.14 模拟运行：先列出准备删除的每个文件与预计释放量，确认后才删除。"""
+        items = self._selected_clean_items()
+        if not items:
+            # 没勾选时预览本次扫描到的全部「可安全清理」项
+            items = [i for i in (getattr(self, "_clean_last_items", []) or [])
+                     if not i.get("active")]
+        if not items:
+            QMessageBox.information(
+                self, APP_NAME,
+                "先点「立即扫描」，再勾选要预览的位置；或者直接勾选列表里的行。")
+            return
+        pv = guard_cleaner.preview(items, limit=300)
+        lines = [
+            f"准备删除 {pv['count']} 个文件，预计释放 {engine.human_size(pv['total'])}。",
+            "",
+            "按类型：" + ("、".join(f"{k} {engine.human_size(v)}"
+                                  for k, v in pv["by_cat"].items()) or "（无）"),
+            "",
+            f"下面列出前 {pv['shown']} 个文件（此刻没有删除任何东西）：",
+            "",
+        ]
+        for f in pv["files"]:
+            lines.append(f"  · {engine.human_size(f['size']):>10}  {f['path']}")
+        if pv["count"] > pv["shown"]:
+            lines.append(f"  …还有 {pv['count'] - pv['shown']} 个未列出")
+        if pv["skipped_active"]:
+            lines.append(f"\n另有 {pv['skipped_active']} 个正在被写入，不会自动删。")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("模拟运行 — 清理清单预览")
+        dlg.resize(780, 470)
+        v = QVBoxLayout(dlg)
+        te = QTextEdit()
+        te.setReadOnly(True)
+        te.setPlainText("\n".join(lines))
+        v.addWidget(te, 1)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        b_cancel = QPushButton("取消（不删除）")
+        b_go = QPushButton("✅ 确认执行清理")
+        b_go.setStyleSheet("background:#2f7d32; color:white; font-weight:bold;")
+        b_cancel.clicked.connect(dlg.reject)
+        b_go.clicked.connect(dlg.accept)
+        btns.addWidget(b_cancel)
+        btns.addWidget(b_go)
+        v.addLayout(btns)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._run_clean(items)
+
     def _clean_selected(self):
         items = self._selected_clean_items()
         if not items:
@@ -3216,7 +3382,8 @@ class MainWindow(QMainWindow):
 
     def _run_clean(self, items):
         def work():
-            res = guard_cleaner.clean(items)
+            cap = int(self._clean_cfg().get("单次上限MB", 0) or 0) * 1024 * 1024
+            res = guard_cleaner.clean(items, max_bytes=cap)
             msgs = ""
             if res["fail"]:
                 msgs = "\n".join(f"{p}（{e}）" for p, e in res["fail"][:5])
@@ -3246,6 +3413,15 @@ class MainWindow(QMainWindow):
         cfg["清理前询问"] = self.cb_clean_ask.isChecked()
         cfg["清崩溃转储"] = self.cb_clean_crash.isChecked()
         cfg["清临时文件"] = self.cb_clean_temp.isChecked()
+        # v6.14：模拟运行 / 文件类型 / 目录白名单 / 累计上限
+        cfg["模拟运行"] = self.cb_clean_dry.isChecked()
+        cfg["允许文件类型"] = [x.strip().lower() for x in
+                              re.split(r"[,，;；\s]+", self.le_clean_types.text())
+                              if x.strip()]
+        cfg["目录白名单"] = [x.strip() for x in
+                            re.split(r"[;；]+", self.le_clean_wl.text())
+                            if x.strip()]
+        cfg["单次上限MB"] = self.sp_clean_cap.value()
         for k, sp in self.sp_clean.items():
             cfg[k] = sp.value()
         self.guard.config["自动清理"] = cfg
@@ -3253,9 +3429,13 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, APP_NAME,
             ("自动清理已开启：每隔 %d 天自动跑一次，超过 %d 天没动过、或大于 %d MB 的"
-             "日志/临时文件会自动清掉。\n%s"
+             "日志/临时文件会自动清掉。\n%s\n%s"
              % (int(cfg["自动周期天"]), int(cfg["日志保留天数"]), int(cfg["超大日志MB"]),
-                "清理前会先问你一次。" if cfg["清理前询问"] else "到点直接清，不再打扰你。")))
+                "清理前会先问你一次。" if cfg["清理前询问"] else "到点直接清，不再打扰你。",
+                "当前为模拟运行：只列清单、不删除任何文件。"
+                if cfg["模拟运行"] else
+                ("单次最多清 %d MB。" % int(cfg["单次上限MB"])
+                 if int(cfg["单次上限MB"]) else "单次清理量不设上限。"))))
 
     # ---------- 自动清理调度 ----------
     def _auto_clean_check(self):
@@ -3278,6 +3458,17 @@ class MainWindow(QMainWindow):
             if total < int(cfg.get("最小清理量MB", 20)) * 1024 * 1024:
                 guard_cleaner.mark_checked()
                 return
+            # v6.14 模拟运行：只报告清单与预计释放量，绝不删除
+            if cfg.get("模拟运行", False):
+                guard_cleaner.mark_checked()
+                bridge.ask(
+                    APP_NAME,
+                    f"【模拟运行】没有删除任何文件。\n\n"
+                    f"本次找到 {len(items)} 个日志 / 临时文件，"
+                    f"预计可释放 {guard_cleaner.human(total)}。\n"
+                    "关掉「模拟运行」后才会真正执行清理。",
+                    "ok", "info")
+                return
             do_it = True
             if cfg.get("清理前询问", True):
                 ans = bridge.ask(
@@ -3287,7 +3478,8 @@ class MainWindow(QMainWindow):
                     "yesno", "question")
                 do_it = (ans == IDYES)
             if do_it:
-                r = guard_cleaner.clean(items)
+                cap = int(cfg.get("单次上限MB", 0) or 0) * 1024 * 1024
+                r = guard_cleaner.clean(items, max_bytes=cap)
                 guard_cleaner.mark_cleaned(r["freed"], len(r["ok"]))
                 if r["freed"] > 0:
                     self.clean_done.emit(r["freed"], len(r["ok"]), len(r["fail"]), "")
@@ -3424,6 +3616,295 @@ class MainWindow(QMainWindow):
             self.guard.quar.purge(qid)
             self._refresh_quar()
 
+    # ---------- 软件迁移向导（v6.14 新增）----------
+    def _build_migrate_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        lay.addLayout(self._page_head(
+            "软件迁移", "整个软件目录搬到别的盘，快捷方式 / 注册表 / 服务引用一起处理"))
+
+        tip = QLabel(
+            "有些软件搬走目录后会打不开，因为原来的路径被写死在快捷方式、注册表或 Windows 服务里。\n"
+            "这个向导先把这些引用找出来、评估风险，再按「复制 → 校验 → 改引用 → 原位留链接」的顺序搬；\n"
+            "任一步失败都会自动还原。服务型软件先给风险等级，程序不会擅自修改服务。")
+        tip.setStyleSheet("color:#555; font-size:12px;")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        top = QHBoxLayout()
+        self.b_mig_refresh = QPushButton("🔄 刷新软件列表")
+        self.b_mig_plan = QPushButton("🧪 生成迁移计划（模拟运行）")
+        self.b_mig_apply = QPushButton("▶️ 执行迁移")
+        self.b_mig_apply.setStyleSheet("background:#2f7d32; color:white; font-weight:bold;")
+        self.b_mig_undo = QPushButton("↩️ 撤销一次迁移")
+        for b in (self.b_mig_refresh, self.b_mig_plan, self.b_mig_apply,
+                  self.b_mig_undo):
+            b.setMinimumHeight(34)
+            top.addWidget(b)
+        top.addStretch(1)
+        lay.addLayout(top)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("搬到："))
+        self.combo_mig_drive = QComboBox()
+        self.combo_mig_drive.setMinimumWidth(260)
+        row.addWidget(self.combo_mig_drive)
+        self.cb_mig_link = QCheckBox("原位置留透明链接（推荐，软件照常按老路径用）")
+        self.cb_mig_link.setChecked(True)
+        row.addWidget(self.cb_mig_link)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._mig_reload_drives()
+
+        self.mig_tree = QTreeWidget()
+        self.mig_tree.setColumnCount(4)
+        self.mig_tree.setHeaderLabels(["软件名称", "安装位置", "体积", "来源"])
+        self.mig_tree.setRootIsDecorated(False)
+        self.mig_tree.setAlternatingRowColors(True)
+        self.mig_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.mig_tree.setColumnWidth(0, 170)
+        self.mig_tree.setColumnWidth(1, 380)
+        self.mig_tree.setColumnWidth(2, 90)
+        self.mig_tree.setColumnWidth(3, 110)
+        self.mig_tree.header().setStretchLastSection(True)
+        self.mig_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        lay.addWidget(self.mig_tree, 1)
+
+        self.mig_plan_view = QTextEdit()
+        self.mig_plan_view.setReadOnly(True)
+        self.mig_plan_view.setMinimumHeight(160)
+        self.mig_plan_view.setPlaceholderText(
+            "选中一个软件、选好目标盘，点「生成迁移计划」——这里会列出风险等级、"
+            "要改哪些快捷方式 / 注册表，以及服务型软件的处理建议。")
+        lay.addWidget(self.mig_plan_view)
+
+        self.lbl_mig_state = QLabel("点「刷新软件列表」开始。")
+        self.lbl_mig_state.setWordWrap(True)
+        self.lbl_mig_state.setStyleSheet("color:#333; font-size:12px;")
+        lay.addWidget(self.lbl_mig_state)
+
+        self.b_mig_refresh.clicked.connect(self._mig_refresh_apps)
+        self.b_mig_plan.clicked.connect(self._mig_make_plan)
+        self.b_mig_apply.clicked.connect(self._mig_do_apply)
+        self.b_mig_undo.clicked.connect(self._mig_do_undo)
+        self.b_mig_apply.setEnabled(False)
+        self._mig_plan = None
+        self._mig_loading = False
+        self._mig_busy = False
+        return w
+
+    def _mig_reload_drives(self):
+        try:
+            drives = guard_drives.list_drives()
+        except Exception:
+            drives = []
+        cur = self.combo_mig_drive.currentData()
+        self.combo_mig_drive.clear()
+        for d in drives:
+            self.combo_mig_drive.addItem(
+                f"{d['letter']} 盘（剩 {engine.human_size(d['free'])}）", d["root"])
+        if cur:
+            i = self.combo_mig_drive.findData(cur)
+            if i >= 0:
+                self.combo_mig_drive.setCurrentIndex(i)
+
+    def _mig_refresh_apps(self):
+        if getattr(self, "_mig_loading", False):
+            return
+        self._mig_loading = True
+        self._mig_reload_drives()
+        self.b_mig_refresh.setEnabled(False)
+        self.lbl_mig_state.setText("正在扫描本机已安装的软件与体积，请稍等…")
+
+        def work():
+            try:
+                rows = guard_migrate.list_apps()
+            except Exception as e:
+                rows = {"__error__": str(e)}
+            self.migrate_apps_done.emit(rows)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_migrate_apps(self, rows):
+        self._mig_loading = False
+        self.b_mig_refresh.setEnabled(True)
+        self.mig_tree.clear()
+        if isinstance(rows, dict):
+            self.lbl_mig_state.setText("扫描失败：" + str(rows.get("__error__", "")))
+            return
+        for a in rows:
+            it = QTreeWidgetItem([a["name"], a["path"],
+                                  engine.human_size(a["size"]), a["source"]])
+            it.setData(0, Qt.UserRole, a)
+            it.setToolTip(1, a["path"])
+            self.mig_tree.addTopLevelItem(it)
+        self.lbl_mig_state.setText(
+            f"找到 {len(rows)} 个可迁移的软件目录。选中一个、选好目标盘，"
+            "再点「生成迁移计划」。（列表按体积排序，绿色/便携软件也在里面）")
+
+    def _mig_current(self):
+        it = self.mig_tree.currentItem()
+        if it is None:
+            QMessageBox.information(self, APP_NAME, "先在列表里选中一个软件。")
+            return None
+        return it.data(0, Qt.UserRole) or {}
+
+    def _mig_make_plan(self):
+        if self._mig_busy:
+            return
+        a = self._mig_current()
+        if not a:
+            return
+        dst = self.combo_mig_drive.currentData()
+        if not dst:
+            QMessageBox.information(self, APP_NAME, "没有检测到可用的目标盘。")
+            return
+        if os.path.splitdrive(a["path"])[0].upper() == \
+                os.path.splitdrive(str(dst))[0].upper():
+            QMessageBox.information(self, APP_NAME,
+                                    "目标盘和软件现在所在的是同一块盘，请换一块盘。")
+            return
+        self._mig_busy = True
+        self._mig_plan = None
+        self.b_mig_apply.setEnabled(False)
+        self.b_mig_plan.setEnabled(False)
+        self.mig_plan_view.setPlainText(
+            "正在检查快捷方式、注册表和服务引用…（只读检查，不会改动任何东西）")
+        self.lbl_mig_state.setText("生成迁移计划中…")
+        keep = self.cb_mig_link.isChecked()
+
+        def work():
+            try:
+                plan = guard_migrate.build_plan(a["path"], dst, keep_link=keep)
+            except Exception as e:
+                plan = {"__error__": str(e)}
+            self.migrate_plan_done.emit(plan)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_migrate_plan(self, plan):
+        self._mig_busy = False
+        self.b_mig_plan.setEnabled(True)
+        if not isinstance(plan, dict) or plan.get("__error__"):
+            self.mig_plan_view.setPlainText("生成计划失败：" +
+                                           str(plan.get("__error__", "")))
+            self.lbl_mig_state.setText("生成计划失败，未改动任何东西。")
+            return
+        self._mig_plan = plan
+        self.mig_plan_view.setPlainText(guard_migrate.plan_summary(plan))
+        lv = plan["risk"]["level"]
+        self.lbl_mig_state.setStyleSheet(
+            f"color:{plan['risk']['color']}; font-size:12px; font-weight:bold;")
+        self.lbl_mig_state.setText(
+            f"风险等级：{lv}。这只是模拟运行，尚未改动任何文件。"
+            + ("　高风险：建议改用「卸载后重装到目标盘」；确要继续请在执行时再次确认。"
+               if lv == "高" else ""))
+        self.b_mig_apply.setEnabled(True)
+
+    def _mig_do_apply(self):
+        plan = self._mig_plan
+        if not plan:
+            QMessageBox.information(self, APP_NAME, "请先生成迁移计划。")
+            return
+        if plan["risk"]["level"] == "高":
+            r = bridge.ask(
+                APP_NAME,
+                f"「{plan['name']}」被评估为高风险迁移：\n\n"
+                + "\n".join("  · " + x for x in plan["risk"]["reasons"][:4])
+                + "\n\n继续可能造成软件或服务无法启动。确定仍要执行吗？",
+                "yesno", "warning")
+            if r != IDYES:
+                return
+        r = bridge.ask(
+            APP_NAME,
+            f"现在开始把「{plan['name']}」搬到\n{plan['dst']} 吗？\n\n"
+            f"共 {plan['files']} 个文件 / {engine.human_size(plan['size'])}；\n"
+            "会先复制并校验，再更新快捷方式与注册表，最后处理原位置。\n"
+            "期间请不要操作这个软件。",
+            "okcancel", "warning")
+        if r != IDOK:
+            return
+        self._mig_busy = True
+        self.b_mig_apply.setEnabled(False)
+        self.lbl_mig_state.setText("正在迁移…（先复制校验，成功后才动源目录）")
+
+        def work():
+            def log(msg):
+                self.migrate_progress.emit(str(msg))
+            try:
+                res = guard_migrate.apply_plan(plan, log=log)
+            except Exception as e:
+                res = {"ok": False, "stage": "异常", "detail": str(e)}
+            self.migrate_apply_done.emit(res)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_migrate_progress(self, text):
+        self.lbl_mig_state.setText("迁移中… " + str(text))
+
+    def _on_migrate_apply(self, res):
+        self._mig_busy = False
+        self.b_mig_apply.setEnabled(True)
+        if res.get("ok"):
+            QMessageBox.information(
+                self, APP_NAME,
+                f"迁移完成：{res['stage']} — {res['detail']}\n\n"
+                f"预计释放 {engine.human_size(res.get('freed', 0))}。\n"
+                "不满意可以点「↩️ 撤销一次迁移」搬回原位。")
+            self.lbl_mig_state.setText(
+                f"✅ 迁移完成：{res['detail']}（可撤销）")
+        else:
+            QMessageBox.warning(self, APP_NAME,
+                                f"迁移没有完成：{res.get('stage', '')}\n\n"
+                                f"{res.get('detail', '')}\n\n"
+                                "你的数据未被破坏，引用已按原样还原。")
+            self.lbl_mig_state.setText(
+                f"❌ {res.get('stage', '未完成')}：{res.get('detail', '')}")
+        self._mig_plan = None
+        self._mig_refresh_apps()
+
+    def _mig_do_undo(self):
+        try:
+            recs = guard_migrate.load_records()
+        except Exception:
+            recs = []
+        if not recs:
+            QMessageBox.information(self, APP_NAME, "还没有可撤销的软件迁移记录。")
+            return
+        labels = [f"{r['名称']}（{r['时间']}）→ {r['新位置']}" for r in recs]
+        pick, ok = QInputDialog.getItem(self, APP_NAME,
+                                        "选择要撤销的一次迁移：", labels, 0, False)
+        if not ok or not pick or pick not in labels:
+            return
+        rec = recs[labels.index(pick)]
+        if bridge.ask(APP_NAME,
+                      f"确定把「{rec['名称']}」搬回\n{rec['原位置']} 吗？\n\n"
+                      "快捷方式与注册表引用也会一并还原。",
+                      "yesno", "question") != IDYES:
+            return
+        self.lbl_mig_state.setText("正在撤销迁移…")
+
+        def work():
+            try:
+                res = guard_migrate.rollback(rec["id"])
+            except Exception as e:
+                res = {"ok": False, "detail": str(e)}
+            self.migrate_rollback_done.emit(res)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_migrate_rollback(self, res):
+        if res.get("ok"):
+            QMessageBox.information(self, APP_NAME, res["detail"])
+        else:
+            QMessageBox.warning(self, APP_NAME,
+                                "撤销未完成：" + str(res.get("detail", "")))
+        self.lbl_mig_state.setText(
+            ("✅ " if res.get("ok") else "❌ ") + str(res.get("detail", "")))
+        self._mig_refresh_apps()
+
     # ---------- 设置 ----------
     def _card_title(self, text, hint="", red=False):
         row = QHBoxLayout()
@@ -3490,6 +3971,74 @@ class MainWindow(QMainWindow):
             gl.addWidget(row)
         lay.addWidget(g1)
 
+        # ---- v6.14：可选监控盘 ----
+        g_drv, gdl = self._card()
+        gdl.addLayout(self._card_title("监控盘选择", "不勾任何盘 = 只保护系统盘"))
+        d1 = QLabel("勾选要拦截写入的盘。保存后 15 秒内生效，不用重启；"
+                    "U 盘插入 / 拔出会自动跟着变。")
+        d1.setStyleSheet(f"color:{GT.C['ink2']};font-size:{GT.human_font(12.5)}pt;")
+        d1.setWordWrap(True)
+        gdl.addWidget(d1)
+        self.drive_checks = {}
+        try:
+            _drives = guard_drives.list_drives()
+        except Exception:
+            _drives = []
+        _raw = {str(x).strip().upper()[:1]
+                for x in (cfg.get("监控盘") or []) if str(x).strip()}
+        if not _raw:
+            _raw = {guard_policy.system_letter()}
+        for d in _drives:
+            cb = QCheckBox(f"{d['letter']} 盘 · {d['type_name']}"
+                           f"（剩 {engine.human_size(d['free'])}）")
+            cb.setChecked(d["letter"] in _raw)
+            self.drive_checks[d["letter"]] = cb
+            gdl.addWidget(cb)
+        if not _drives:
+            gdl.addWidget(QLabel("（没有检测到可用磁盘，将按系统盘保护）"))
+        r_drv = QHBoxLayout()
+        self.cb_watch_removable = QCheckBox("U 盘插入时自动纳入监控")
+        self.cb_watch_removable.setChecked(bool(cfg.get("监控可移动盘")))
+        self.cb_fast_relocate = QCheckBox("落盘后秒级迁移（命中限制规则时直接搬，不弹窗）")
+        self.cb_fast_relocate.setChecked(bool(cfg.get("落盘后秒级迁移")))
+        self.cb_fast_relocate.setToolTip(
+            "保持「落盘后询问 / 迁移」路线，不做内核驱动：\n"
+            "内核过滤需要 EV 签名 + WHQL 认证 + 64 位兼容 + 系统异常处理，\n"
+            "稳定性代价太高。落盘稳定 1 秒后按你选过的盘自动搬走，更稳。")
+        r_drv.addWidget(self.cb_watch_removable)
+        r_drv.addWidget(self.cb_fast_relocate)
+        r_drv.addStretch(1)
+        gdl.addLayout(r_drv)
+        lay.addWidget(g_drv)
+
+        # ---- v6.14：拦截白名单 ----
+        g_wl, gwl = self._card()
+        gwl.addLayout(self._card_title("拦截白名单", "这些位置 / 进程一律不弹窗"))
+        d2 = QLabel("每行一条：填目录（如 D:\\Games）或路径片段（如 SteamLibrary），"
+                    "以 .exe 结尾的按进程名处理。命中的写入直接放行，不改文件、不删数据。")
+        d2.setStyleSheet(f"color:{GT.C['ink2']};font-size:{GT.human_font(12.5)}pt;")
+        d2.setWordWrap(True)
+        gwl.addWidget(d2)
+        self.wl_list = QListWidget()
+        self.wl_list.setMaximumHeight(110)
+        for v in (cfg.get("拦截白名单") or []):
+            self.wl_list.addItem(QListWidgetItem("📁 " + str(v)))
+        for v in (cfg.get("白名单进程") or []):
+            self.wl_list.addItem(QListWidgetItem("⚙️ " + str(v) + "  [进程]"))
+        gwl.addWidget(self.wl_list)
+        r_wl = QHBoxLayout()
+        self.le_wl = QLineEdit()
+        self.le_wl.setPlaceholderText("目录路径，如 D:\\Games；或程序名，如 OneDrive.exe")
+        b_wl_add = QPushButton("➕ 添加")
+        b_wl_del = QPushButton("🗑 删除选中")
+        b_wl_add.clicked.connect(self._wl_add)
+        b_wl_del.clicked.connect(self._wl_del)
+        r_wl.addWidget(self.le_wl, 1)
+        r_wl.addWidget(b_wl_add)
+        r_wl.addWidget(b_wl_del)
+        gwl.addLayout(r_wl)
+        lay.addWidget(g_wl)
+
         # ---- 阈值 ----
         g2, g2l = self._card()
         g2l.addLayout(self._card_title("阈值", "数值越小，询问越勤快"))
@@ -3529,6 +4078,15 @@ class MainWindow(QMainWindow):
             "注意：无论这个开关如何，真正决定限制哪些软件的，都是你在下面\n"
             "「软件存储限制」里自己添加的规则。")
         g3l.addWidget(row_s)
+        row_d = GT.SwitchRow("深度来源识别（数字签名 / 进程关联）",
+                             "核验发布者与正在写入的进程，稍慢但更准",
+                             bool(cfg.get("深度来源识别", False)))
+        self.cb_deep_attr = row_d.sw
+        self.cb_deep_attr.setToolTip(
+            "开启后，每次扫描会对前 20 个来源目录读取 .exe 数字签名、\n"
+            "列出证书发布者，并关联当前正在运行的进程；结果带缓存。\n"
+            "单条详情随时可在「今日新增」里右键查看，与这个开关无关。")
+        g3l.addWidget(row_d)
         lay.addWidget(g3)
 
         # ---- 软件存储限制 ----
@@ -3654,6 +4212,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _wl_add(self):
+        v = self.le_wl.text().strip()
+        if not v:
+            return
+        if v.lower().endswith((".exe", ".com")):
+            self.wl_list.addItem(QListWidgetItem("⚙️ " + v + "  [进程]"))
+        else:
+            self.wl_list.addItem(QListWidgetItem("📁 " + v))
+        self.le_wl.clear()
+
+    def _wl_del(self):
+        for it in self.wl_list.selectedItems():
+            self.wl_list.takeItem(self.wl_list.row(it))
+
     def _save_settings(self):
         cfg = self.guard.config
         for key, cb in self.sw.items():
@@ -3667,12 +4239,36 @@ class MainWindow(QMainWindow):
             guard_today.set_builtin_signatures(on)
         except Exception:
             pass
+        # v6.14：可选监控盘 + 白名单（保存后立即重算监听，不用重启）
+        try:
+            cfg["监控盘"] = [l for l, cb in self.drive_checks.items()
+                             if cb.isChecked()]
+            cfg["监控可移动盘"] = self.cb_watch_removable.isChecked()
+            cfg["落盘后秒级迁移"] = self.cb_fast_relocate.isChecked()
+            cfg["深度来源识别"] = self.cb_deep_attr.isChecked()
+            paths, procs = [], []
+            for i in range(self.wl_list.count()):
+                t = self.wl_list.item(i).text()
+                if t.startswith("⚙️ "):
+                    v = t[2:].replace("  [进程]", "").strip()
+                    if v:
+                        procs.append(v)
+                else:
+                    v = t[2:].strip() if t.startswith("📁 ") else t.strip()
+                    if v:
+                        paths.append(v)
+            cfg["拦截白名单"] = paths
+            cfg["白名单进程"] = procs
+            cfg["全盘监控根"] = guard_policy.roots(cfg)
+            self.guard.refresh_watchers()
+        except Exception:
+            pass
         self.guard.save_config()
         self._set_autostart(self.cb_autostart.isChecked())
         self._refresh_rules_label()
         QMessageBox.information(self, APP_NAME,
-                                "设置已保存。部分阈值类设置即刻生效，\n"
-                                "监听范围类设置会在下次启动守卫时生效。")
+                                "设置已保存。阈值与监控盘 / 白名单即刻生效，\n"
+                                "监听线程会在 15 秒内自动同步，不需要重启程序。")
 
     # ---------- 工具 ----------
     def _do_dashboard(self):

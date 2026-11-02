@@ -365,7 +365,14 @@ class LegacyScanner:
         return False
 
     # ---- 扫描 ----
-    def scan(self, baseline_ts: float, progress_cb=None, cancel_evt=None) -> dict:
+    def scan(self, baseline_ts: float, progress_cb=None, cancel_evt=None,
+             progressive: bool = True) -> dict:
+        """v6.14：默认走分步扫描 —— 先统计大目录，再按占用高低逐个展开分支。
+
+        界面能持续看到「阶段 1/2 · 第几个分支」，磁盘压力也更平稳；
+        progressive=False 可退回 v6.13 的一次性并发扫描（用于结果比对）。
+        两种模式的统计口径完全一致（见 _test_v614.py 的逐项断言）。
+        """
         buckets = {}
 
         # v6.12：原实现单线程串行 scandir，整盘盘点要几分钟。
@@ -412,11 +419,38 @@ class LegacyScanner:
             roots.append((base, 0, {"key": base, "depth": depth,
                                     "exclude": exclude}))
 
-        guard_fastscan.parallel_scan(
-            roots, descend, visit, cancel_evt=cancel_evt,
-            progress_cb=(lambda n, cur: progress_cb(len(buckets), cur))
-                        if progress_cb else None,
-            progress_every=300, stat_dirs=False)
+        if progressive and roots:
+            for base, _lvl, ctx in roots:
+                if cancel_evt is not None and cancel_evt.is_set():
+                    break
+
+                def _branch_ctx(e, _c=ctx, _b=base, _d=descend):
+                    return _d(_b, 0, _c, e)
+
+                def _branch_filter(e, _c=ctx, _s=self):
+                    if _s._skip(e.name):
+                        return False
+                    if _c["exclude"] and e.name.lower() in _c["exclude"]:
+                        return False
+                    return True
+
+                guard_fastscan.progressive_scan(
+                    base, ctx, descend, visit,
+                    branch_ctx_fn=_branch_ctx, branch_filter=_branch_filter,
+                    phase_cb=(lambda st, i, n, path, _p=progress_cb, _b=buckets:
+                              _p(len(_b), "分步 %d/2 · %d/%d · %s"
+                                 % (st, i, n,
+                                    os.path.basename(str(path)) or str(path))))
+                    if progress_cb else None,
+                    progress_cb=(lambda n, cur: progress_cb(len(buckets), cur))
+                    if progress_cb else None,
+                    cancel_evt=cancel_evt, stat_dirs=False, progress_every=300)
+        else:
+            guard_fastscan.parallel_scan(
+                roots, descend, visit, cancel_evt=cancel_evt,
+                progress_cb=(lambda n, cur: progress_cb(len(buckets), cur))
+                            if progress_cb else None,
+                progress_every=300, stat_dirs=False)
         return self._finalize(buckets.values(), baseline_ts)
 
     def _finalize(self, rows, baseline_ts: float) -> dict:
