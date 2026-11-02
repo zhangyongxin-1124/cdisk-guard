@@ -15,6 +15,7 @@ guard_cleaner.py — 日志 / 崩溃转储 / 临时文件 自动清理
 """
 
 import os
+import threading
 import re
 import json
 import time
@@ -25,6 +26,7 @@ MB = 1024 * 1024
 GB = 1024 ** 3
 
 # 本软件数据目录（与主程序同目录；frozen 时由主程序注入）
+import guard_fastscan          # v6.13 并发快扫引擎
 from guard_appdir import APP_DIR
 STATE_PATH = APP_DIR / "cleaner_state.json"
 
@@ -195,7 +197,8 @@ def _walk(roots, budget_s=25.0, max_files=300000):
             continue
 
 
-def scan(cfg=None, roots=None, budget_s=25.0, max_files=300000, max_items=2000):
+def scan(cfg=None, roots=None, budget_s=25.0, max_files=300000,
+         max_items=2000, progress_cb=None):
     """扫描可清理目标。
 
     返回 dict：
@@ -226,32 +229,48 @@ def scan(cfg=None, roots=None, budget_s=25.0, max_files=300000, max_items=2000):
     truncated = False
     t0 = time.time()
 
-    for e in _walk(roots, budget_s=budget_s, max_files=max_files):
+    # ---- v6.13：改走并发快扫引擎（原单线程 _walk 每文件 2 次 time.time，
+    # 30 万文件时把 GIL 吃满、界面跟着卡）。预算/上限检查提到「每层」粒度，
+    # 触发上限立即全局取消，不再逐条空转。 ----
+    cancel = threading.Event()
+    deadline = t0 + budget_s
+
+    def descend(parent, level, ctx, entry):
+        return None if level >= 8 else ctx     # 与 _walk 的 depth<8 一致
+
+    def visit(entry, parent, level, ctx):
+        nonlocal scanned, skipped_active, total, total_safe, truncated
+        if cancel.is_set():
+            return
+        if scanned >= max_files or len(items) >= max_items:
+            truncated = truncated or len(items) >= max_items
+            cancel.set()
+            return
+        if time.time() > deadline:
+            cancel.set()
+            return
         scanned += 1
-        try:
-            st = e.stat(follow_symlinks=False)
-        except OSError:
-            continue
-        size = st.st_size
-        if size <= 0:
-            continue
-        p = e.path
+        size = entry.size
+        if size <= 0 or entry.is_dir:
+            return
+        p = entry.path
         pl = p.lower()
         if pl in have:
-            continue
+            return
         have.add(pl)
         if _is_excluded(pl):
-            continue
+            return
         cat = classify(p, temp_prefixes)
         if not cat:
-            continue
+            return
         if cat == "崩溃转储" and not do_crash:
-            continue
+            return
         if cat == "临时文件" and not do_temp:
-            continue
+            return
 
-        age_days = (now - st.st_mtime) / 86400.0
-        idle_min = (now - st.st_mtime) / 60.0
+        mtime = entry.mtime
+        age_days = (now - mtime) / 86400.0
+        idle_min = (now - mtime) / 60.0
         reason = ""
         active = False          # 正在被软件写入
 
@@ -264,12 +283,12 @@ def scan(cfg=None, roots=None, budget_s=25.0, max_files=300000, max_items=2000):
             if active:
                 skipped_active += 1     # 列出来给你看，但不会自动删
         else:
-            continue
+            return
 
         items.append({
             "path": p,
             "size": size,
-            "mtime": st.st_mtime,
+            "mtime": mtime,
             "age_days": age_days,
             "cat": cat,
             "reason": reason,
@@ -280,7 +299,14 @@ def scan(cfg=None, roots=None, budget_s=25.0, max_files=300000, max_items=2000):
             total_safe += size
         if len(items) >= max_items:
             truncated = True
-            break
+            cancel.set()
+
+    guard_fastscan.parallel_scan(
+        [(r, 0, 0) for r in roots],       # ctx 用 0：None 表示“不下钻”
+        descend, visit, cancel_evt=cancel,
+        progress_cb=(lambda n, cur: progress_cb(scanned, cur))
+                    if progress_cb else None,
+        progress_every=400)
 
     items.sort(key=lambda x: -x["size"])
     return {
