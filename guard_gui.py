@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import threading
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import (Qt, QTimer, Signal, QObject, QSize, QRectF, QPointF,
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from guard_appdir import APP_DIR        # 统一数据目录（自动适配本机）
+import guard_fastscan             # v6.12 高性能扫描引擎
 
 # 程序自带的静态资源（图标、声明文件）放在 exe 旁边，不属于"数据"，
 # 因此始终按 exe 所在目录找——数据目录可能已回退到 %LOCALAPPDATA%。
@@ -71,7 +73,7 @@ import guard_theme as GT
 from guard_bridge import bridge, IDYES, IDNO, IDCANCEL, IDOK
 
 APP_NAME = "C盘守卫"
-APP_VERSION = "6.11"
+APP_VERSION = "6.12"
 ICON_PATH = _resource("guard_icon.ico")
 MB = engine  # 常量速记
 
@@ -1195,7 +1197,8 @@ class MainWindow(QMainWindow):
         else:
             self.show()
 
-        # 启动即扫一遍今日新增（后台）
+        # 启动即先显示上次结果（秒开，不让用户盯着空白等），再后台刷新
+        QTimer.singleShot(150, self._show_today_cache)
         QTimer.singleShot(1200, self.start_scan)
         # 每 60 秒自动刷新记录/今日列表
         self.auto_timer = QTimer(self)
@@ -1438,7 +1441,8 @@ class MainWindow(QMainWindow):
         """收集环境自检信息。for_copy=True 时输出纯文本（复制给开发者排查）。"""
         g = self.guard
         br = []
-        br.append(f"程序版本：v{APP_VERSION}")
+        br.append(f"程序版本：v{APP_VERSION}（高速扫描引擎 · "
+                   f"{guard_fastscan.default_workers()} 线程并发）")
         try:
             import platform
             br.append("操作系统：{} {}".format(
@@ -2206,15 +2210,19 @@ class MainWindow(QMainWindow):
         self.btn_legacy_stop.setEnabled(True)
         self.lbl_legacy_state.setText(
             f"正在盘点 {'、'.join(letters)} 盘（后台进行，不影响守护）…"
-            "盘里文件多的时候需要几分钟，可以先做别的事")
+            "高速扫描已开启，文件再多通常十几秒～一分钟，可以先做别的事")
         cancel = threading.Event()
         self._legacy_cancel = cancel
+        self._legacy_t0 = time.time()
 
         def work():
+            t0 = time.time()
             done = []
-            for L in letters:
+            lock = threading.Lock()
+
+            def one(L):
                 if cancel.is_set():
-                    break
+                    return
                 sc = guard_legacy.LegacyScanner(APP_DIR, L)
                 try:
                     data = sc.scan(
@@ -2226,9 +2234,16 @@ class MainWindow(QMainWindow):
                     data = {"rows": [], "total": 0, "count": 0, "err": str(e),
                             "drive": L, "baseline": base, "ts": time.time()}
                 sc.save(data)
-                done.append(L)
-            self.legacy_done.emit({"letters": done, "all": all_drives,
-                                   "canceled": cancel.is_set()})
+                with lock:
+                    done.append(L)
+
+            # v6.12：多块盘同时盘点（原来是一个盘扫完才轮到下一个）
+            with ThreadPoolExecutor(max_workers=min(4, len(letters)),
+                                    thread_name_prefix="DriveScan") as ex:
+                list(ex.map(one, letters))
+            self.legacy_done.emit({"letters": sorted(done), "all": all_drives,
+                                   "canceled": cancel.is_set(),
+                                   "seconds": time.time() - t0})
 
         self.legacy_thread = threading.Thread(target=work, daemon=True)
         self.legacy_thread.start()
@@ -2239,7 +2254,8 @@ class MainWindow(QMainWindow):
         self.lbl_legacy_state.setText("正在停止…（已经盘完的盘会保留）")
 
     def _on_legacy_progress(self, text):
-        self.lbl_legacy_state.setText("盘点中… " + text)
+        el = time.time() - getattr(self, "_legacy_t0", time.time())
+        self.lbl_legacy_state.setText(f"高速盘点中… 已用 {el:.0f}s｜" + text)
 
     def _on_legacy_done(self, res):
         self.btn_legacy_scan.setEnabled(True)
@@ -2253,7 +2269,9 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_legacy_state.setText(
                 f"盘点完成 {datetime.datetime.now():%H:%M:%S}｜"
-                f"这次盘了 {'、'.join(x + ' 盘' for x in letters) if letters else '—'}")
+                f"这次盘了 {'、'.join(x + ' 盘' for x in letters) if letters else '—'}"
+                + (f"｜⚡ 用时 {res['seconds']:.1f} 秒（多盘并行）"
+                   if res.get("seconds") else ""))
         self._reload_drive_combo()
         self._fill_legacy_overview()
         self._fill_legacy_rows()
@@ -2427,6 +2445,18 @@ class MainWindow(QMainWindow):
         col, order = mapping.get(mode, (5, Qt.SortOrder.DescendingOrder))
         self.today_tree.sortItems(col, order)
 
+    def _show_today_cache(self):
+        """v6.12：先把上次扫描结果摆出来（毫秒级），后台再高速刷新。"""
+        try:
+            data = self.scanner.load()
+            items = data.get("items", []) or []
+            if items:
+                self._fill_today(items)
+                self.lbl_scan_state.setText(
+                    f"已载入上次结果（{len(items)} 项）｜后台正在高速刷新…")
+        except Exception:
+            pass
+
     def start_scan(self):
         if self.scan_thread and self.scan_thread.is_alive():
             return
@@ -2434,11 +2464,13 @@ class MainWindow(QMainWindow):
         drv = getattr(self, "_cur_drive", "C")
         self.lbl_scan_state.setText(
             f"正在扫描 {drv} 盘（后台进行，不影响守护）…" +
-            ("（整盘扫描可能需要几分钟，可以先做别的事）" if drv != guard_drives.system_letter() else ""))
+            ("（高速扫描已开启，通常十几秒～一分钟）" if drv != guard_drives.system_letter() else ""))
         cancel = threading.Event()
         self._scan_cancel = cancel
+        self._scan_t0 = time.time()
 
         def work():
+            t0 = time.time()
             try:
                 data = self.scanner.scan(progress_cb=lambda n, cur:
                                          self.scan_progress.emit(n, cur),
@@ -2447,6 +2479,7 @@ class MainWindow(QMainWindow):
                 data = {"items": [], "total_size": 0, "count": 0,
                         "err": str(e)}
             data = dict(data)
+            data["scan_seconds"] = time.time() - t0
             data["day"] = datetime.date.today().isoformat()
             self.scanner.save(data)
             self.scan_done.emit(data)
@@ -2459,14 +2492,19 @@ class MainWindow(QMainWindow):
         cur = str(cur or "")
         if len(cur) > 66:
             cur = cur[:30] + " … " + cur[-30:]
-        self.lbl_scan_state.setText(f"扫描中… 已发现 {n} 项 | {cur}")
+        el = time.time() - getattr(self, "_scan_t0", time.time())
+        self.lbl_scan_state.setText(
+            f"高速扫描中… 已用 {el:.1f}s，已发现 {n} 项 | {cur}")
 
     def _on_scan_done(self, data):
         self.btn_scan.setEnabled(True)
         drv = getattr(self, "_cur_drive", "")
         self.lbl_scan_state.setText(
             f"{drv} 盘扫描完成 {datetime.datetime.now():%H:%M:%S}｜共 {data['count']} 项，"
-            f"合计 {engine.human_size(data['total_size'])}")
+            f"合计 {engine.human_size(data['total_size'])}"
+            + (f"｜⚡ 用时 {data['scan_seconds']:.1f} 秒"
+               f"（{guard_fastscan.default_workers()} 线程并发）"
+               if data.get("scan_seconds") else ""))
         self._refresh_drive_bar()
         self._fill_today(data.get("items", []))
 
