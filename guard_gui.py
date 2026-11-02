@@ -73,7 +73,7 @@ import guard_theme as GT
 from guard_bridge import bridge, IDYES, IDNO, IDCANCEL, IDOK
 
 APP_NAME = "C盘守卫"
-APP_VERSION = "6.12"
+APP_VERSION = "6.13"
 ICON_PATH = _resource("guard_icon.ico")
 MB = engine  # 常量速记
 
@@ -1039,6 +1039,7 @@ class MainWindow(QMainWindow):
     scan_done = Signal(dict)
     move_done = Signal(int, int, int, str, str)   # moved_files, freed, failed, msgs, dest_root
     clean_scan_done = Signal(object)              # 日志清理扫描结果 dict
+    clean_scan_progress = Signal(int, str)        # 日志清理扫描进度
     clean_done = Signal(int, int, int, str)       # freed, ok_count, fail_count, msgs
     legacy_progress = Signal(str)                 # 存量盘点进度
     legacy_done = Signal(dict)                    # 存量盘点完成
@@ -1164,6 +1165,7 @@ class MainWindow(QMainWindow):
         self.scan_done.connect(self._on_scan_done)
         self.move_done.connect(self._after_move)
         self.clean_scan_done.connect(self._on_clean_scan_done)
+        self.clean_scan_progress.connect(self._on_clean_scan_progress)
         self.clean_done.connect(self._on_clean_done)
         self.legacy_progress.connect(self._on_legacy_progress)
         self.legacy_done.connect(self._on_legacy_done)
@@ -2117,6 +2119,15 @@ class MainWindow(QMainWindow):
 
     def _fill_legacy_rows(self):
         """下面的明细：这块盘里每一块内容是什么。"""
+        # v6.13：重建期间暂停重绘，防止大表卡界面
+        self.legacy_tree.setUpdatesEnabled(False)
+        try:
+            self._fill_legacy_rows_impl()
+        finally:
+            self.legacy_tree.setUpdatesEnabled(True)
+            self.legacy_tree.update()
+
+    def _fill_legacy_rows_impl(self):
         t = self.legacy_tree
         t.clear()
         letter = self._legacy_drive()
@@ -2497,6 +2508,8 @@ class MainWindow(QMainWindow):
             f"高速扫描中… 已用 {el:.1f}s，已发现 {n} 项 | {cur}")
 
     def _on_scan_done(self, data):
+        self._today_fp = (data.get("day"), len(data.get("items") or []),
+                          data.get("total_size"), data.get("ts"))
         self.btn_scan.setEnabled(True)
         drv = getattr(self, "_cur_drive", "")
         self.lbl_scan_state.setText(
@@ -2562,6 +2575,15 @@ class MainWindow(QMainWindow):
         return f"{self._fmt_hm(f)}~{self._fmt_hm(l)}"
 
     def _fill_today(self, items):
+        # v6.13：重建期间暂停重绘——几千行也不会把界面卡住
+        self.today_tree.setUpdatesEnabled(False)
+        try:
+            self._fill_today_impl(items)
+        finally:
+            self.today_tree.setUpdatesEnabled(True)
+            self.today_tree.update()
+
+    def _fill_today_impl(self, items):
         self.today_tree.clear()
         self._today_items = items
         by_path = {it["path"]: it for it in items}
@@ -2900,7 +2922,12 @@ class MainWindow(QMainWindow):
             self._reload_drive_if_changed()
             data = self.scanner.load()
             if data.get("items") and not (self.scan_thread and self.scan_thread.is_alive()):
-                self._fill_today(data["items"])
+                # v6.13：数据指纹没变就不重建（原来每 60 秒无脑重刷大表）
+                fp = (data.get("day"), len(data.get("items") or []),
+                      data.get("total_size"), data.get("ts"))
+                if fp != getattr(self, "_today_fp", None):
+                    self._today_fp = fp
+                    self._fill_today(data["items"])
         except Exception:
             pass
 
@@ -3050,13 +3077,23 @@ class MainWindow(QMainWindow):
 
         def work():
             try:
-                res = guard_cleaner.scan(cfg)
+                res = guard_cleaner.scan(
+                    cfg,
+                    progress_cb=lambda n, cur:
+                        self.clean_scan_progress.emit(n, cur))
             except Exception as e:
                 res = {"items": [], "total": 0, "scanned": 0, "elapsed": 0,
                        "skipped_active": 0, "truncated": False, "error": str(e)}
             self.clean_scan_done.emit(res)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_clean_scan_progress(self, n, cur):
+        # v6.13：扫描中给出实时进度（引擎已按 100ms 节流，不卡界面）
+        cur = str(cur or "")
+        if len(cur) > 60:
+            cur = cur[:28] + " … " + cur[-28:]
+        self.lbl_clean.setText(f"高速扫描中… 已检查 {n} 个文件 | {cur}")
 
     def _on_clean_scan_done(self, res):
         self._clean_scanning = False
@@ -3066,6 +3103,15 @@ class MainWindow(QMainWindow):
         self._fill_clean(res)
 
     def _fill_clean(self, res):
+        # v6.13：重建期间暂停重绘，防止大表卡界面
+        self.clean_tree.setUpdatesEnabled(False)
+        try:
+            self._fill_clean_impl(res)
+        finally:
+            self.clean_tree.setUpdatesEnabled(True)
+            self.clean_tree.update()
+
+    def _fill_clean_impl(self, res):
         self.clean_tree.setSortingEnabled(False)
         self.clean_tree.clear()
         total = res.get("total", 0)

@@ -100,14 +100,18 @@ def iter_entries(directory, cancel_evt=None, stat_dirs=True):
 
 
 def default_workers() -> int:
-    """并发线程数：CPU 核数与 8 取小，环境变量 GUARD_SCAN_WORKERS 可覆盖。"""
+    """并发线程数：CPU 核数减 1（留一核给界面，扫描时点击才不卡），
+    上限 8；环境变量 GUARD_SCAN_WORKERS 可覆盖。"""
     try:
         v = int(os.environ.get("GUARD_SCAN_WORKERS", "0"))
         if 1 <= v <= 32:
             return v
     except (TypeError, ValueError):
         pass
-    return max(2, min(8, (os.cpu_count() or 4)))
+    n = os.cpu_count() or 4
+    if n >= 4:
+        n -= 1                    # 给界面线程留一核，UI 不卡
+    return max(2, min(8, n))
 
 
 def parallel_scan(roots, descend, visit, *, workers=None, cancel_evt=None,
@@ -136,6 +140,8 @@ def parallel_scan(roots, descend, visit, *, workers=None, cancel_evt=None,
     stat = {"dirs": 0, "entries": 0}
     canceled = False
 
+    last_progress = [0.0]      # v6.13：进度按时间节流，不再轰炸界面线程
+
     def _layer(cur, level, ctx):
         """处理一层：一次加锁批量回调（每条加锁在 4 万目录时是明显瓶颈），
         返回需要继续下钻的子任务。"""
@@ -149,10 +155,17 @@ def parallel_scan(roots, descend, visit, *, workers=None, cancel_evt=None,
             stat["dirs"] += 1
             n = stat["dirs"]
         if progress_cb and n % max(1, progress_every) == 0:
-            try:
-                progress_cb(n, cur)
-            except Exception:
-                pass
+            now = time.time()
+            if now - last_progress[0] >= 0.1:
+                last_progress[0] = now
+                try:
+                    progress_cb(n, cur)
+                except Exception:
+                    pass
+        # v6.13：每层结束主动让出 GIL/CPU——扫描再忙，界面点击也立刻响应
+        time.sleep(0)
+        if n % 256 == 0:
+            time.sleep(0.001)  # 每 256 层小歇 1ms，给界面呼吸
         subs = []
         for entry in entries:
             if entry.is_dir:
