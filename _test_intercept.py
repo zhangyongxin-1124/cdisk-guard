@@ -135,6 +135,36 @@ def main():
         ck("C 盘根新文件不排除", not g.is_excluded(r"C:\U盘文件\setup.exe"))
         ck("用户目录新文件不排除", not g.is_excluded(r"C:\Users\演示\Desktop\照片.jpg"))
 
+        # ============ 5b. v6.11 换机消毒：坏配置一律纠正 ============
+        print("[5b] v6.11 换机消毒")
+        sd = os.environ.get("SystemDrive", "C:").rstrip("\\") + "\\"
+        bad = tmp / "config_bad.json"
+        bad.write_text(json.dumps({
+            "全盘拦截": True,
+            "全盘监控根": ["Z:////不存在"],
+        }, ensure_ascii=False), encoding="utf-8")
+        (tmp / "config.json").write_text(bad.read_text(encoding="utf-8"),
+                                         encoding="utf-8")
+        g2 = engine.Guard()
+        ck("监控根被纠正为系统盘根", g2.config["全盘监控根"] == [sd],
+           str(g2.config["全盘监控根"]))
+        # 用户主动关全盘拦截时，监控根仍被纠正，但开关不被偷偷打开
+        (tmp / "config.json").write_text(json.dumps({
+            "全盘拦截": False, "全盘监控根": [],
+        }, ensure_ascii=False), encoding="utf-8")
+        g3 = engine.Guard()
+        ck("尊重全盘拦截开关(false)", g3.config.get("全盘拦截") is False)
+        ck("监控根仍纠正", g3.config["全盘监控根"] == [sd])
+        # 重点目录指向不存在的旧电脑路径 → 改指当前用户同名目录
+        home = Path(os.environ.get("USERPROFILE", str(Path.home())))
+        (tmp / "config.json").write_text(json.dumps({
+            "监控目录": {"桌面": r"C://Users//别人//Desktop"},
+        }, ensure_ascii=False), encoding="utf-8")
+        g4 = engine.Guard()
+        ck("重点目录纠正到当前用户",
+           g4.config["监控目录"]["桌面"] == str(home / "Desktop"),
+           str(g4.config["监控目录"]))
+
         # ============ 6. 监控根合法性 ============
         print("[6] start_watchers 输入")
         roots = g.start_watchers()

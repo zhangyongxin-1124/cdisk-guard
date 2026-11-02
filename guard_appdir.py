@@ -311,7 +311,7 @@ def _relocate_one(path_str: str, home: Path):
 def relocate_user_paths(cfg: dict) -> dict:
     """就地修正配置里所有指向「别人用户目录」的路径。
 
-    覆盖：监控目录 / 全盘监控根 / 删除保护目录 / 聚合监控目录。
+    覆盖：监控目录 / 全盘监控根 / 删除保护目录 / 聚合监控目录 / 安装监控目录。
     返回 {'changed': [改动说明]}
     """
     home = current_user_home()
@@ -333,7 +333,7 @@ def relocate_user_paths(cfg: dict) -> dict:
 
     if isinstance(cfg.get("监控目录"), dict):
         fix_map(cfg["监控目录"])
-    for key in ("全盘监控根", "删除保护目录", "聚合监控目录"):
+    for key in ("全盘监控根", "删除保护目录", "聚合监控目录", "安装监控目录"):
         if isinstance(cfg.get(key), list):
             fix_list(cfg[key])
     return {"changed": changed}

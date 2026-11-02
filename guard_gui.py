@@ -71,6 +71,7 @@ import guard_theme as GT
 from guard_bridge import bridge, IDYES, IDNO, IDCANCEL, IDOK
 
 APP_NAME = "C盘守卫"
+APP_VERSION = "6.11"
 ICON_PATH = _resource("guard_icon.ico")
 MB = engine  # 常量速记
 
@@ -1044,7 +1045,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.guard = guard
         self.scanner = guard.today
-        self.setWindowTitle(f"{APP_NAME} · 桌面版 v6.7 — 正在守护 C 盘")
+        self.setWindowTitle(f"{APP_NAME} · 桌面版 v{APP_VERSION} — 正在守护 C 盘")
         self.resize(1180, 720)
         self.setMinimumSize(1000, 640)
         self.scan_thread = None
@@ -1081,7 +1082,7 @@ class MainWindow(QMainWindow):
         bt.setSpacing(0)
         t1 = QLabel("C盘守卫")
         t1.setStyleSheet(f"font-weight:700;font-size:{GT.human_font(16)}pt;")
-        t2 = QLabel("桌面版 v6.7")
+        t2 = QLabel(f"桌面版 v{APP_VERSION}")
         t2.setStyleSheet(f"color:{GT.C['ink3']};font-size:{GT.human_font(11)}pt;")
         bt.addWidget(t1)
         bt.addWidget(t2)
@@ -1209,6 +1210,8 @@ class MainWindow(QMainWindow):
         # 存量盘点：进入就有上次的结果可看（没有就显示一句引导）
         QTimer.singleShot(1500, self._fill_legacy_overview)
         QTimer.singleShot(1600, self._fill_legacy_rows)
+        # 环境自检：等引擎监听线程起来之后再刷新一次
+        QTimer.singleShot(2500, self.refresh_selfcheck)
 
     # ---------- 概况 ----------
     @staticmethod
@@ -1338,6 +1341,9 @@ class MainWindow(QMainWindow):
         hl.addLayout(info, 1)
         lay.addWidget(hero)
 
+        # ---- 环境自检卡（v6.11）：换电脑后一眼看出为什么没拦截 ----
+        lay.addWidget(self._build_selfcheck_card())
+
         # ---- 全部磁盘总览 ----
         lay.addWidget(GT.section_title("全部磁盘总览"))
         self.drive_box = QFrame()
@@ -1382,6 +1388,132 @@ class MainWindow(QMainWindow):
 
         self._refresh_home()          # 内部会一并刷新「全部磁盘总览」
         return w
+
+    # ---------- 环境自检（v6.11：换电脑排障） ----------
+    def _build_selfcheck_card(self):
+        card = QFrame()
+        card.setProperty("card", True)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(22, 16, 22, 16)
+        v.setSpacing(10)
+
+        head = QHBoxLayout()
+        t = QLabel("环境自检")
+        t.setStyleSheet(f"font-size:{GT.human_font(15)}pt;font-weight:700;")
+        sub = QLabel("换电脑后如果「读不到 C 盘 / 不弹拦截」，看这里就能定位原因")
+        sub.setStyleSheet(f"color:{GT.C['ink3']};font-size:{GT.human_font(12)}pt;")
+        sub.setWordWrap(True)
+        head.addWidget(t)
+        head.addSpacing(10)
+        head.addWidget(sub, 1)
+        self.sc_pill = QLabel("检测中…")
+        self.sc_pill.setStyleSheet(
+            f"background:{GT.C['blue_soft']};color:#2A5C8F;font-weight:600;"
+            f"font-size:{GT.human_font(12)}pt;border-radius:10px;padding:3px 12px;")
+        head.addWidget(self.sc_pill)
+        v.addLayout(head)
+
+        self.sc_text = QLabel()
+        self.sc_text.setWordWrap(True)
+        self.sc_text.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.sc_text.setStyleSheet(
+            f"font-size:{GT.human_font(12)}pt;color:{GT.C['ink2']};line-height:150%;")
+        v.addWidget(self.sc_text)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        b1 = GT.style_button(QPushButton("重新检测"), None)
+        b1.clicked.connect(self.refresh_selfcheck)
+        b2 = GT.style_button(QPushButton("复制诊断信息"), None)
+        b2.clicked.connect(self._copy_selfcheck)
+        b1.setMinimumHeight(36)
+        b2.setMinimumHeight(36)
+        btns.addWidget(b1)
+        btns.addWidget(b2)
+        v.addLayout(btns)
+        return card
+
+    def _selfcheck_lines(self, for_copy=False):
+        """收集环境自检信息。for_copy=True 时输出纯文本（复制给开发者排查）。"""
+        g = self.guard
+        br = []
+        br.append(f"程序版本：v{APP_VERSION}")
+        try:
+            import platform
+            br.append("操作系统：{} {}".format(
+                platform.system(), platform.win32_ver()[0]))
+        except Exception:
+            pass
+        br.append("当前用户目录（USERPROFILE）：{}".format(
+            os.environ.get("USERPROFILE", "?")))
+        br.append("数据目录：{}（{}）".format(
+            APP_DIR, "便携模式·exe同目录" if APP_DIR.parent == EXE_DIR
+            or APP_DIR == EXE_DIR else "已回退到 LOCALAPPDATA（exe 位置只读）"))
+
+        cfgp = engine.CONFIG_PATH
+        br.append("配置文件：{}（{}）".format(
+            cfgp, "已生成本机配置" if cfgp.exists() else "尚未生成（首次运行会自动生成）"))
+
+        roots = g.config.get("全盘监控根", [])
+        br.append("监控范围：{}（系统盘全盘，系统目录自动排除；排除词 {} 条）".format(
+            "、".join(roots) if roots else "未配置！",
+            len(g.config.get("排除路径关键词", []))))
+        mon = g.config.get("监控目录", {})
+        miss = [k for k, v in mon.items() if v and not os.path.isdir(v)]
+        br.append("重点目录：{} 个，{} 存在".format(
+            len(mon), "全部" if not miss else "有缺失: " + ",".join(miss)))
+
+        ws = getattr(g, "watchers", [])
+        if ws:
+            ok = sum(1 for w in ws if w.ok)
+            errs = "; ".join("{}: {}".format(w.root, w.error)
+                             for w in ws if not w.ok and w.error)
+            br.append("监听线程：{} 个，正常 {} 个{}".format(
+                len(ws), ok, "" if not errs else "，异常 → " + errs))
+        else:
+            br.append("监听线程：0 个 —— 全盘拦截未启动！")
+        return br
+
+    def refresh_selfcheck(self):
+        """刷新概况页的环境自检卡。"""
+        if not hasattr(self, "sc_text"):
+            return
+        try:
+            br = self._selfcheck_lines()
+            ok_watch = bool(getattr(self.guard, "watchers", [])) and \
+                any(w.ok for w in self.guard.watchers)
+            cfg_ok = engine.CONFIG_PATH.exists()
+            if ok_watch and cfg_ok:
+                self.sc_text.setText("\n".join("· " + x for x in br))
+                self.sc_pill.setText("✓ 本机适配正常，拦截已生效")
+                self.sc_pill.setStyleSheet(
+                    f"background:{GT.C['green_soft']};color:{GT.C['green_deep']};"
+                    f"font-weight:600;font-size:{GT.human_font(12)}pt;"
+                    f"border-radius:10px;padding:3px 12px;")
+            else:
+                self.sc_text.setText(
+                    "\n".join("· " + x for x in br) +
+                    "\n❗ 拦截未生效：若是 Windows 提示「已保护你的电脑」，请点「更多信息」"
+                    "→「仍要运行」；若被杀毒软件拦截，请把 C盘守卫.exe 加入信任。")
+                self.sc_pill.setText("⚠ 拦截未生效")
+                self.sc_pill.setStyleSheet(
+                    f"background:{GT.C['red_soft']};color:#A03030;"
+                    f"font-weight:600;font-size:{GT.human_font(12)}pt;"
+                    f"border-radius:10px;padding:3px 12px;")
+        except Exception:
+            pass
+
+    def _copy_selfcheck(self):
+        try:
+            txt = "C盘守卫环境诊断（{}）\n".format(
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M")) + \
+                "\n".join(self._selfcheck_lines(for_copy=True))
+            QApplication.clipboard().setText(txt)
+            QMessageBox.information(self, "已复制",
+                                    "诊断信息已复制到剪贴板，可直接粘贴发给开发者排查。")
+        except Exception as e:
+            QMessageBox.warning(self, "复制失败", str(e))
 
     def _style_home_pill(self, kind):
         colors = {"ok": (GT.C["green_soft"], GT.C["green_deep"]),
@@ -2722,6 +2854,7 @@ class MainWindow(QMainWindow):
 
     def _auto_refresh(self):
         self._refresh_home()
+        self.refresh_selfcheck()
         # 切到别的盘时不要自动重刷列表，免得把用户正在看的结果冲掉
         if getattr(self, "_cur_drive", None) not in (None, guard_drives.system_letter()):
             return
