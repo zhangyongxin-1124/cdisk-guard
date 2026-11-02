@@ -732,17 +732,45 @@ class Guard:
         except Exception:
             pass
 
-        # 监控范围升级：老版本只监听用户目录（C:\Users\<用户>），把文件复制/移动
-        # 到 C 盘根目录或其他位置不会触发询问。统一升级为监听整个 C 盘，
-        # 并补齐新增的系统目录排除词（旧配置里没有，不补会噪音爆炸）。
-        if cfg.get("全盘拦截") and list(cfg.get("全盘监控根") or []) != ["C:\\"]:
-            cfg["全盘监控根"] = ["C:\\"]
+        # 监控范围升级（v6.11 加固）：老版本只监听用户目录（C:\Users\<用户>），
+        # 把文件复制/移动到 C 盘根目录或其他位置不会触发询问。
+        # 统一升级为监听「系统盘根目录」（用 %SystemDrive% 动态取，任何电脑都对），
+        # 不再信配置里写死的值——哪怕配置被改坏/从别的电脑带过来，这里都会纠正。
+        _sys_root = (os.environ.get("SystemDrive") or "C:").rstrip("\\") + "\\"
+        if list(cfg.get("全盘监控根") or []) != [_sys_root]:
+            cfg["全盘监控根"] = [_sys_root]
             need_write = True
+        # 注：全盘拦截开关（全盘拦截: true/false）尊重用户在设置页的选择，不在此强制。
         kws = list(cfg.get("排除路径关键词") or [])
         miss = [k for k in DEFAULT_CONFIG["排除路径关键词"] if k not in kws]
         if miss:
             cfg["排除路径关键词"] = kws + miss
             need_write = True
+
+        # 换电脑兜底：监控目录若在本机不存在（比如软件目录被改过名），
+        # 改指当前用户下的同名目录，绝不让监控落在一个不存在的路径上。
+        try:
+            _mon = cfg.get("监控目录")
+            if isinstance(_mon, dict):
+                for _k, _v in list(_mon.items()):
+                    if _v and not os.path.isdir(_v):
+                        _alt = C_USER / Path(_v).name
+                        if os.path.isdir(_alt):
+                            _mon[_k] = str(_alt)
+                            need_write = True
+            _agg = cfg.get("聚合监控目录")
+            if isinstance(_agg, list):
+                _agg2 = []
+                for _v in _agg:
+                    if _v and not os.path.isdir(_v):
+                        _alt = C_USER / Path(_v).name
+                        _v = str(_alt) if os.path.isdir(_alt) else _v
+                    _agg2.append(_v)
+                if _agg2 != _agg:
+                    cfg["聚合监控目录"] = _agg2
+                    need_write = True
+        except Exception:
+            pass
 
         if need_write:
             try:
