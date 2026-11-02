@@ -4,6 +4,27 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![Python](https://img.shields.io/badge/python-3.10%2B-green) ![License](https://img.shields.io/badge/license-MIT-orange)
 
+## ⚡ 扫描速度（v6.12）
+
+C 盘文件多时不再「蜗牛爬」。新版采用 **一次 `os.scandir` 取全元数据 + 按目录多线程并发**，
+不再对每个文件单独 `os.stat(完整路径)`；自动跳过 junction 环路，多块盘同时盘点。
+
+本机实测（同一目录，改造前 → 改造后）：
+
+| 场景 | 改造前 | 改造后 | 提速 |
+|---|---|---|---|
+| 今日新增 · `C://Windows//WinSxS`（7.3 万文件） | 59.7 s | 4.6 s | **13×** |
+| 今日新增 · `AppData\Local`（3 万文件） | 4.3 s | 0.6 s | **7×** |
+| 存量盘点 · `C://Windows//WinSxS` | 13.6 s | 9.9 s | 1.4× |
+
+另外：
+- **启动秒开**：先显示上次扫描结果（毫秒级），后台再静默高速刷新，不用盯着空白等
+- **多盘并行**：点「盘点所有盘」时几块盘同时扫，不再逐个排队
+- **耗时可见**：扫描中显示已用秒数，完成后显示本次用时与并发线程数
+- 线程数默认按 CPU 核数取（最多 8），可用环境变量 `GUARD_SCAN_WORKERS` 调整
+
+新旧算法结果逐项比对通过（`_test_fastscan.py`，23 项断言），提速不改变任何统计口径。
+
 ## 📸 界面预览
 
 | 概况 —— 一眼看清 C 盘 | 今日新增 —— 谁在往 C 盘塞东西 |

@@ -16,6 +16,7 @@ Windows 自己的设置入口（ms-settings 链接），不是我们自己动手
   C盘守卫.exe --report        生成周报（适合放到任务计划里每周跑一次）
 """
 
+import guard_fastscan          # v6.12 高性能扫描引擎
 import os
 import sys
 import json
@@ -74,34 +75,29 @@ def disk_state():
 # ============================================================
 
 def _aggregate(root: Path, depth: int, agg: dict, budget=None):
-    """走一遍目录树，把每个文件的大小归到 depth 层以内的祖先头上。"""
+    """把每个文件的大小归到 depth 层以内的祖先头上（v6.12 并发快扫）。"""
     root_str = str(root)
-    for cur, dirs, files in os.walk(root_str):
+
+    def descend(parent, level, ctx, entry):
+        if level + 1 > depth:
+            return None
         try:
-            st = os.lstat(cur)
-            if st.st_file_attributes & gp.REPARSE:
-                dirs[:] = []
-                continue
-        except OSError:
-            continue
-        try:
-            rel = Path(cur).relative_to(root)
-            parts = rel.parts
+            parts = Path(entry.path).relative_to(root).parts
         except ValueError:
             parts = ()
-        if len(parts) > depth:
-            dirs[:] = []
-            continue
         prefix = "/".join(parts[:depth]) if parts else "."
-        for fn in files:
-            fp = os.path.join(cur, fn)
-            try:
-                s = os.stat(fp).st_size
-            except OSError:
-                continue
-            key = f"{root_str}\\{prefix}" if prefix != "." else root_str
-            agg[key] = agg.get(key, 0) + s
-        dirs[:] = [d for d in dirs if not _is_link(os.path.join(cur, d))]
+        return {"prefix": prefix, "depth": depth}
+
+    def visit(entry, parent, level, ctx):
+        if entry.is_dir:
+            return
+        prefix = ctx["prefix"]
+        key = f"{root_str}\\{prefix}" if prefix != "." else root_str
+        agg[key] = agg.get(key, 0) + entry.size
+
+    guard_fastscan.parallel_scan(
+        [(root_str, 0, {"prefix": ".", "depth": depth})],
+        descend, visit, stat_dirs=False)
 
 
 def _is_link(p) -> bool:
