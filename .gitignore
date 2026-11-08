@@ -32,6 +32,17 @@ space_snapshots.json
 # 首次使用时间基线
 install_time.json
 便携版/install_time.json
+# v6.14 / v6.15 新增运行数据（软件清单、签名缓存、联动盘档案、迁移记录）
+software_migrations.json
+便携版/software_migrations.json
+attribution_overrides.json
+便携版/attribution_overrides.json
+signature_cache.json
+便携版/signature_cache.json
+link_disk.json
+便携版/link_disk.json
+migration_backups/
+attribution_tmp/
 
 # ---- 2. 日志与报告 ----
 guard_log/

@@ -11,6 +11,7 @@ a = Analysis(
                    'guard_paths', 'guard_wizard', 'guard_bridge', 'guard_theme',
                    'guard_legacy', 'guard_appdir', 'guard_fastscan',
                    'guard_migrate', 'guard_attribution', 'guard_policy',
+                   'guard_linkdisk',
                    'PySide6.QtSvg'],
     hookspath=[],
     hooksconfig={},

@@ -452,9 +452,13 @@ class TodayScanner:
                           "app": guess_app(entry.path),
                           "is_dir": entry.is_dir})
 
+        # v6.15：mtime 过滤前移到引擎层 —— 不是今天的文件连 visit 回调
+        # 都不进（WinSxS 等 7 万文件的大目录只剩个位数命中），
+        # 聚合与加锁开销大减；进度/条目统计口径不变。
         guard_fastscan.parallel_scan(
             [(str(root), 0, {"depth": depth}) for root, depth in roots],
             descend, visit, cancel_evt=cancel_evt,
+            entry_filter=lambda e: e.mtime >= day0,
             progress_cb=(lambda n, cur: progress_cb(len(items), cur))
                         if progress_cb else None,
             progress_every=200, stat_dirs=True)

@@ -249,6 +249,26 @@ def main() -> int:
     c.ck("def preview(" in s_clean and "dry_run" in s_clean,
          "guard_cleaner 含模拟运行（dry-run）")
 
+    # ---------- 11c. v6.15 联动盘：代码与两份文档同时存在 ----------
+    s_link = read(ROOT / "guard_linkdisk.py")
+    c.ck(bool(s_link), "guard_linkdisk.py 存在", "联动盘模块缺失")
+    c.ck("guard_linkdisk" in s_spec, "spec hiddenimports 含 guard_linkdisk",
+         "新模块没进打包配置，exe 里会缺功能")
+    c.ck("`guard_linkdisk.py`" in s_readme, "README 源码结构表含 guard_linkdisk.py")
+    for key in ("联动盘提醒", "联动盘阈值GB", "联动盘最小提示MB",
+                "联动盘冷却天", "联动盘目标盘"):
+        c.ck(f'"{key}"' in s_engine, f"引擎默认配置含「{key}」")
+    for label, txt in (("README", s_readme), ("使用说明", s_manual)):
+        for kw in ("联动盘", "门牌号", "2GB", "还原"):
+            c.ck(kw in txt, f"{label} 提到「{kw}」",
+                 "v6.15 新功能缺说明，文档与代码不一致")
+        c.ck("软件迁移" in txt, f"{label} 说明联动盘与软件迁移的分工")
+    c.ck("def link_app(" in s_link and "def unlink_app(" in s_link,
+         "guard_linkdisk 具备创建与还原能力",
+         "函数改名后需同步文档与校验规则")
+    c.ck((ROOT / "_test_v615_linkdisk.py").exists(),
+         "联动盘专项测试脚本存在")
+
     # ---------- 12. 发布包内文档（可选）----------
     if args.zip:
         zp = Path(args.zip)

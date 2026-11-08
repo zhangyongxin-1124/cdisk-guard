@@ -37,19 +37,25 @@ from concurrent.futures import ThreadPoolExecutor
 
 IS_WINDOWS = sys.platform == "win32"
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+FILE_ATTRIBUTE_DIRECTORY = 0x10
 
 
 class Entry:
-    """一条目录项。__slots__ 是为了几十万条时少占内存、少做属性字典。"""
-    __slots__ = ("path", "name", "size", "mtime", "ctime", "is_dir")
+    """一条目录项。__slots__ 是为了几十万条时少占内存、少做属性字典。
 
-    def __init__(self, path, name, size, mtime, ctime, is_dir):
+    v6.15：ino = 文件引用号（Windows 的 st_ino，来自 stat 缓存、免费），
+    存量盘点用它建 FRN→路径映射，配合 USN 增量刷新（见 guard_usn.py）。
+    """
+    __slots__ = ("path", "name", "size", "mtime", "ctime", "is_dir", "ino")
+
+    def __init__(self, path, name, size, mtime, ctime, is_dir, ino=0):
         self.path = path
         self.name = name
         self.size = size
         self.mtime = mtime
         self.ctime = ctime
         self.is_dir = is_dir
+        self.ino = int(ino or 0)
 
 
 def _is_junction(e) -> bool:
@@ -70,15 +76,17 @@ def iter_entries(directory, cancel_evt=None, stat_dirs=True):
     每个文件条目只做一次 e.stat()；Windows 下 DirEntry 已缓存 FindFirstFile
     拿到的元数据，比 os.stat(完整路径) 快一个数量级。
 
-    stat_dirs=False 时目录条目不再 stat（mtime/ctime 填 0）——
-    存量盘点/增长聚合只看文件大小，能省掉几万次无用的系统调用。
+    stat_dirs=False 时目录条目不再 stat（mtime/ctime/ino 填 0）——
+    存量盘点/增长聚合只看文件大小；v6.15 起存量盘点改传 True（取目录 ino
+    供 USN 增量用，本地 NTFS 上 stat 命中缓存、无额外系统调用成本）。
     """
     if cancel_evt is not None and cancel_evt.is_set():
         return
+    _cancel = cancel_evt.is_set if cancel_evt is not None else None
     try:
         with os.scandir(directory) as it:
             for e in it:
-                if cancel_evt is not None and cancel_evt.is_set():
+                if _cancel is not None and _cancel():
                     return
                 try:
                     if _is_junction(e):
@@ -92,7 +100,9 @@ def iter_entries(directory, cancel_evt=None, stat_dirs=True):
                     mt = getattr(st, "st_mtime", 0) or 0
                     yield Entry(e.path, e.name,
                                 0 if is_dir else int(st.st_size or 0),
-                                float(mt or 0), float(ct or mt or 0), is_dir)
+                                float(mt or 0), float(ct or mt or 0),
+                                is_dir,
+                                getattr(st, "st_ino", 0) or 0)
                 except (OSError, ValueError):
                     continue
     except (OSError, ValueError):
@@ -116,7 +126,7 @@ def default_workers() -> int:
 
 def parallel_scan(roots, descend, visit, *, workers=None, cancel_evt=None,
                   progress_cb=None, progress_every=200, expand=2,
-                  stat_dirs=True):
+                  stat_dirs=True, entry_filter=None, preloaded=None):
     """并发遍历多棵目录树。
 
     参数
@@ -131,6 +141,11 @@ def parallel_scan(roots, descend, visit, *, workers=None, cancel_evt=None,
     progress_cb(n_dirs, cur_dir) : 每扫过 progress_every 个目录回调一次
     expand : 顶层子任务不足 workers*expand 时，再展开一层以提高并发度
     stat_dirs : 是否对「目录条目」取 mtime/ctime（只需要文件信息时设 False）
+    entry_filter : v6.15 可选；f(entry)->bool，False 的「文件」跳过 visit
+        但照常计入进度/条目统计（目录不受影响、照常下钻）。
+        今日新增用它把 mtime 过滤前移到引擎层，聚合回调大幅减少。
+    preloaded : v6.15 可选 dict{normcase(path): [Entry,...]}；
+        命中即用（分步扫描阶段 1 的枚举在阶段 2 复用，不重复 I/O）。
 
     返回 {"dirs", "entries", "elapsed", "workers", "canceled"}
     """
@@ -142,15 +157,28 @@ def parallel_scan(roots, descend, visit, *, workers=None, cancel_evt=None,
 
     last_progress = [0.0]      # v6.13：进度按时间节流，不再轰炸界面线程
 
+    def _entries_of(cur):
+        """取一层条目：preloaded 命中即复用（分步扫描免重复 I/O）。"""
+        got = preloaded.pop(os.path.normcase(cur), None) \
+            if preloaded else None
+        if got is not None:
+            return got
+        return list(iter_entries(cur, cancel_evt, stat_dirs))
+
     def _layer(cur, level, ctx):
         """处理一层：一次加锁批量回调（每条加锁在 4 万目录时是明显瓶颈），
         返回需要继续下钻的子任务。"""
-        entries = list(iter_entries(cur, cancel_evt, stat_dirs))
+        entries = _entries_of(cur)
         if not entries and cur is None:
             return []
         with lock:
-            for entry in entries:
-                visit(entry, cur, level, ctx)
+            if entry_filter is None:
+                for entry in entries:
+                    visit(entry, cur, level, ctx)
+            else:
+                for entry in entries:
+                    if entry.is_dir or entry_filter(entry):
+                        visit(entry, cur, level, ctx)
             stat["entries"] += len(entries)
             stat["dirs"] += 1
             n = stat["dirs"]
@@ -227,11 +255,14 @@ def quick_space(root: str):
 # ============================================================
 
 def shallow_stats(path, depth: int = 2, cancel_evt=None,
-                  stat_dirs: bool = True) -> tuple:
+                  stat_dirs: bool = True, collected: dict = None) -> tuple:
     """浅层统计：只遍历前 depth 层，快速估出一个目录有多大。
 
     纯迭代、不启线程池 —— 阶段一按顶层目录挨个跑也不吃 CPU。
     返回 (总字节, 文件数)。
+
+    v6.15：传入 collected(dict) 时，把沿途每一层的枚举结果按
+    normcase(目录路径) 收集起来，供阶段 2 直接复用，不再重复 I/O。
     """
     total = [0]
     cnt = [0]
@@ -240,7 +271,10 @@ def shallow_stats(path, depth: int = 2, cancel_evt=None,
         if cancel_evt is not None and cancel_evt.is_set():
             break
         cur, level = stack.pop()
-        for e in iter_entries(cur, cancel_evt, stat_dirs):
+        es = list(iter_entries(cur, cancel_evt, stat_dirs))
+        if collected is not None:
+            collected[os.path.normcase(cur)] = es
+        for e in es:
             if e.is_dir:
                 if level + 1 < depth:
                     stack.append((e.path, level + 1))
@@ -254,7 +288,7 @@ def progressive_scan(root, root_ctx, descend, visit, *,
                      phase_cb=None, progress_cb=None, cancel_evt=None,
                      workers=None, stat_dirs=True, shallow_depth=2,
                      top_n=0, progress_every=200, branch_ctx_fn=None,
-                     branch_filter=None):
+                     branch_filter=None, entry_filter=None):
     """两阶段扫描一个盘（或一个大目录）。
 
     阶段 1「统计大目录」：只读顶层 + 浅层 2 层，给每个一级子目录估出体积，
@@ -263,6 +297,9 @@ def progressive_scan(root, root_ctx, descend, visit, *,
       （不再把所有分支同时丢进线程池），磁盘压力平稳、进度持续可见。
       每展开完一个回调 phase_cb(2, i, n, path)。
 
+    v6.15：阶段 1 枚举过的每一层结果通过 preloaded 直接交给阶段 2，
+    头 shallow_depth 层不再重复 I/O；另透传 entry_filter / dir_cache。
+
     top_n > 0 时只展开前 N 个最占空间的分支（快速预览用）；0 = 全展开。
     返回 {"summaries": [...], "phase1_s", "phase2_s", "elapsed", "branches"}
     """
@@ -270,19 +307,22 @@ def progressive_scan(root, root_ctx, descend, visit, *,
     root = str(root)
     workers = workers or default_workers()
 
-    # ---- 阶段 1：顶层概览 ----
+    # ---- 阶段 1：顶层概览（枚举结果顺手收集，供阶段 2 复用）----
     p1 = time.time()
+    preloaded = {}
     try:
         top_entries = list(iter_entries(root, cancel_evt, stat_dirs))
     except Exception:
         top_entries = []
+    preloaded[os.path.normcase(root)] = list(top_entries)
     summaries = []
     dirs = [e for e in top_entries
             if e.is_dir and (branch_filter(e) if branch_filter else True)]
     for i, e in enumerate(dirs, 1):
         if cancel_evt is not None and cancel_evt.is_set():
             break
-        size, cnt = shallow_stats(e.path, shallow_depth, cancel_evt, stat_dirs)
+        size, cnt = shallow_stats(e.path, shallow_depth, cancel_evt,
+                                  stat_dirs, collected=preloaded)
         summaries.append({"path": e.path, "name": e.name,
                           "size": size, "files": cnt})
         if phase_cb:
@@ -294,7 +334,8 @@ def progressive_scan(root, root_ctx, descend, visit, *,
     for e in top_entries:
         if cancel_evt is not None and cancel_evt.is_set():
             break
-        visit(e, root, 0, root_ctx)      # 阶段一单线程，无需加锁
+        if entry_filter is None or e.is_dir or entry_filter(e):
+            visit(e, root, 0, root_ctx)      # 阶段一单线程，无需加锁
     summaries.sort(key=lambda x: -x["size"])
     phase1_s = time.time() - p1
 
@@ -312,7 +353,8 @@ def progressive_scan(root, root_ctx, descend, visit, *,
         parallel_scan([(s["path"], 1, bctx)], descend, visit,
                       workers=workers, cancel_evt=cancel_evt,
                       progress_cb=progress_cb, progress_every=progress_every,
-                      stat_dirs=stat_dirs, expand=1)
+                      stat_dirs=stat_dirs, expand=1,
+                      entry_filter=entry_filter, preloaded=preloaded)
         if phase_cb:
             try:
                 phase_cb(2, i, len(selected), s["path"])

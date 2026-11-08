@@ -174,12 +174,45 @@ def main():
             "  ⑥ 原位置留 junction 透明链接，软件按老路径照常读写")
         win.lbl_mig_state.setText("风险等级：中。这只是模拟运行，尚未改动任何文件。")
 
+        # 联动盘页：注入演示行（真实体检要枚举进程，截图没必要跑）
+        win.link_tree.clear()
+        for nm, sz, st, pos in [
+                ("微信", "3.4 GB", "已建",
+                 "D:\\C盘守卫联动盘\\Users\\演示\\AppData\\Roaming\\WeChat"),
+                ("剪映专业版", "2.1 GB", "未建",
+                 "C:\\Users\\演示\\AppData\\Local\\JianyingPro"),
+                ("Chrome", "1.3 GB", "未建",
+                 "C:\\Users\\演示\\AppData\\Local\\Google\\Chrome"),
+                ("Steam", "860 MB", "不再提示",
+                 "C:\\Program Files (x86)\\Steam\\steamapps")]:
+            win.link_tree.addTopLevelItem(QTreeWidgetItem([nm, sz, st, pos]))
+        win.lbl_link.setText(
+            "共记录 4 个软件，已建联动盘 1 个，累计腾出约 3.4 GB。"
+            "提示会自动出现在托盘，不用一直开这个页面。")
+
         for key in ["overview", "today", "clean", "guardlog", "quarantine",
-                    "settings", "legacy", "migrate"]:
+                    "settings", "legacy", "migrate", "linkdisk"]:
             win._goto_page(key)
             if key == "legacy":       # 明确重刷，确保读到演示快照
                 win._fill_legacy_overview()
                 win._fill_legacy_rows()
+            if key == "linkdisk":
+                # 进页会自动重读档案（会带出本机真实路径），截图必须用演示数据
+                win.link_tree.clear()
+                for nm, sz, st, pos in [
+                        ("微信", "3.4 GB", "已建",
+                         "D:\\C盘守卫联动盘\\Users\\演示\\AppData\\Roaming\\WeChat"),
+                        ("剪映专业版", "2.1 GB", "未建",
+                         "C:\\Users\\演示\\AppData\\Local\\JianyingPro"),
+                        ("Chrome", "1.3 GB", "未建",
+                         "C:\\Users\\演示\\AppData\\Local\\Google\\Chrome"),
+                        ("Steam", "860 MB", "不再提示",
+                         "C:\\Program Files (x86)\\Steam\\steamapps")]:
+                    win.link_tree.addTopLevelItem(QTreeWidgetItem([nm, sz, st, pos]))
+                win.lbl_link.setText(
+                    "共记录 4 个软件，已建联动盘 1 个，累计腾出约 3.4 GB。"
+                    "提示会自动出现在托盘，不用一直开这个页面。")
+                app.processEvents()
             for _ in range(8):
                 app.processEvents()
             p = os.path.join(OUT, f"{key}.png")

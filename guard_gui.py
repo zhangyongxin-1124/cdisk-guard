@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QHeaderView, QAbstractItemView, QStyle,
     QGridLayout, QLineEdit, QStackedWidget, QFrame, QScrollArea, QSizePolicy,
     QDateEdit, QTableWidget, QTableWidgetItem, QTextEdit, QInputDialog,
+    QDoubleSpinBox,
 )
 
 from guard_appdir import APP_DIR        # 统一数据目录（自动适配本机）
@@ -73,11 +74,12 @@ import guard_legacy
 import guard_migrate          # v6.14 软件迁移向导
 import guard_attribution      # v6.14 来源归因增强
 import guard_policy           # v6.14 可选监控盘 + 拦截白名单
+import guard_linkdisk         # v6.15 联动盘
 import guard_theme as GT
 from guard_bridge import bridge, IDYES, IDNO, IDCANCEL, IDOK
 
 APP_NAME = "C盘守卫"
-APP_VERSION = "6.14"
+APP_VERSION = "6.15"
 ICON_PATH = _resource("guard_icon.ico")
 MB = engine  # 常量速记
 
@@ -139,6 +141,10 @@ class BridgeUI(QObject):
             dlg = RootFolderDialog(p["title"], p["text"])
             dlg.exec()
             return {"choice": dlg.result_id}
+        if t == "link_disk":
+            dlg = LinkDiskDialog(p["title"], p["text"], p.get("app_name", ""))
+            dlg.exec()
+            return {"action": dlg.action}
         if t == "app_block":
             dlg = BlockedAppDialog(p["title"], p["text"], p.get("rule_name", ""))
             dlg.exec()
@@ -262,6 +268,62 @@ class RootFolderDialog(QDialog):
 
     def _done(self, rid):
         self.result_id = rid
+        self.accept()
+
+
+class LinkDiskDialog(QDialog):
+    """联动盘提示：给这个软件换个「仓库」，C 盘只留门牌号。
+
+    只做选择，不执行任何文件操作 —— 用户点「好」之后才去选盘、才搬数据。
+    """
+
+    LINK = "link"
+    LATER = "later"
+    NEVER = "never"
+
+    def __init__(self, title, text, app_name="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.resize(600, 520)
+        self.action = self.LATER
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.setSpacing(10)
+
+        h = QLabel(f"给「{app_name}」建一个联动盘？" if app_name else "建一个联动盘？")
+        h.setStyleSheet(f"font-size:{GT.human_font(17)}pt;font-weight:700;")
+        lay.addWidget(h)
+
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        lbl.setStyleSheet(
+            f"font-size:{GT.human_font(12.5)}pt;line-height:150%;"
+            f"color:{GT.C['ink2']};background:#F7F9FC;border:1px solid #E6ECF5;"
+            "border-radius:8px;padding:12px;")
+        lay.addWidget(lbl, 1)
+
+        b_link = QPushButton("好，建联动盘（下一步选放哪个盘）")
+        b_link.setMinimumHeight(42)
+        b_link.setStyleSheet(
+            "background:#1565c0;color:white;font-weight:bold;font-size:14px;"
+            "border-radius:8px;")
+        b_later = QPushButton("先不用，过几天再问我")
+        b_later.setMinimumHeight(34)
+        b_never = QPushButton("这个软件以后别再问")
+        b_never.setMinimumHeight(30)
+        b_never.setStyleSheet(f"color:{GT.C['ink3']};border:none;")
+        b_link.clicked.connect(lambda: self._done(self.LINK))
+        b_later.clicked.connect(lambda: self._done(self.LATER))
+        b_never.clicked.connect(lambda: self._done(self.NEVER))
+        lay.addWidget(b_link)
+        lay.addWidget(b_later)
+        lay.addWidget(b_never)
+
+    def _done(self, action):
+        self.action = action
         self.accept()
 
 
@@ -942,6 +1004,35 @@ class GuiGuard(engine.Guard):
             return root if root else "skip"
         return "skip"
 
+    # ---------- 联动盘提醒（v6.15）----------
+    def ask_link_disk(self, item):
+        """软件首次被使用 / 数据超过阈值时的主动提醒。
+
+        返回 ("link", 目标盘) / ("later", "") / ("never", "")，执行仍交给引擎。
+        """
+        if self.auto_choice:
+            return ("later", "")
+        app = item.get("app") or {}
+        name = app.get("name") or "这个软件"
+        text = guard_linkdisk.explain(
+            app, item.get("size", 0), item.get("dirs") or [],
+            item.get("trigger", ""))
+        res = bridge.dialog({"type": "link_disk",
+                             "title": "C盘守卫 — 给它建一个联动盘？",
+                             "app_name": name, "text": text})
+        act = res.get("action") or LinkDiskDialog.LATER
+        if act == LinkDiskDialog.LINK:
+            root = self.pick_drive(
+                "C 盘守卫 — 数据放哪个盘",
+                f"把「{name}」的数据放到哪个盘？\n"
+                "C 盘只留一个门牌号，软件照旧能用；以后新数据也自动落到这个盘。")
+            if not root:
+                return ("later", "")
+            return ("link", root)
+        if act == LinkDiskDialog.NEVER:
+            return ("never", "")
+        return ("later", "")
+
     # ---------- 自启动注册（桌面版启动后缩在托盘）----------
     @staticmethod
     def ensure_autostart():
@@ -1054,6 +1145,9 @@ class MainWindow(QMainWindow):
     migrate_rollback_done = Signal(object)        # 回滚结果 dict
     migrate_progress = Signal(str)                # 进度文案
     attr_detail_done = Signal(object)             # 来源详情 dict
+    # ---- v6.15 联动盘 ----
+    link_scan_done = Signal(object)               # 体检结果 {"added","total"}
+    link_job_done = Signal(str, object)           # ("make"/"undo", 结果 dict)
 
     def __init__(self, guard: GuiGuard, minimized=False):
         super().__init__()
@@ -1119,6 +1213,7 @@ class MainWindow(QMainWindow):
             ("guardlog",   "守卫记录", self._build_log_tab()),
             ("quarantine", "隔离区",   self._build_quar_tab()),
             ("migrate",    "软件迁移", self._build_migrate_tab()),
+            ("linkdisk",   "联动盘",   self._build_linkdisk_tab()),
             ("settings",   "设置",     self._build_settings_tab()),
         )
         for i, (key, title, page_w) in enumerate(pages):
@@ -1187,6 +1282,8 @@ class MainWindow(QMainWindow):
         self.migrate_rollback_done.connect(self._on_migrate_rollback)
         self.migrate_progress.connect(self._on_migrate_progress)
         self.attr_detail_done.connect(self._on_attr_detail)
+        self.link_scan_done.connect(self._on_link_scan_done)
+        self.link_job_done.connect(self._on_link_job_done)
 
         # 枚举本机磁盘，初始化"检测位置"下拉
         self._reload_drive_combo()
@@ -1643,6 +1740,9 @@ class MainWindow(QMainWindow):
                 and self.mig_tree.topLevelItemCount() == 0 \
                 and not getattr(self, "_mig_loading", False):
             self._mig_refresh_apps()
+        # v6.15：每次进「联动盘」页都重读档案（引擎后台可能刚建好一个）
+        if key == "linkdisk":
+            self._refresh_linkdisk()
 
     def _goto_drive(self, letter):
         """概况页按钮：切到今日新增页并把检测位置切到指定盘。"""
@@ -3931,6 +4031,314 @@ class MainWindow(QMainWindow):
         lay.setSpacing(4)
         return f, lay
 
+    # ========================================================
+    # 联动盘（v6.15）
+    # ========================================================
+    def _build_linkdisk_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        cfg = self.guard.config
+        lay.addLayout(self._page_head(
+            "联动盘", "把这些软件的数据放到别的盘，C 盘只留一个「门牌号」"))
+
+        # ---- 白话解释 ----
+        g0, g0l = self._card()
+        g0l.addLayout(self._card_title("这是什么", "软件不用重装、不用改设置"))
+        for line in guard_linkdisk.benefit_lines():
+            lb = QLabel("•   " + line)
+            lb.setWordWrap(True)
+            lb.setStyleSheet(
+                f"color:{GT.C['ink2']};font-size:{GT.human_font(12.5)}pt;")
+            g0l.addWidget(lb)
+        lay.addWidget(g0)
+
+        # ---- 提醒时机 ----
+        g1, g1l = self._card()
+        g1l.addLayout(self._card_title("什么时候提醒我", "只在真正值得提醒的时候打扰你"))
+        self.cb_link_on = QCheckBox(
+            "第一次打开某个软件、或它在 C 盘的数据超过阈值时，问我要不要建联动盘")
+        self.cb_link_on.setChecked(bool(cfg.get("联动盘提醒", True)))
+        self.cb_link_on.stateChanged.connect(lambda _c: self._save_link_cfg())
+        g1l.addWidget(self.cb_link_on)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("某个软件在 C 盘超过"))
+        self.sp_link_gb = QDoubleSpinBox()
+        self.sp_link_gb.setRange(0.5, 100.0)
+        self.sp_link_gb.setSingleStep(0.5)
+        self.sp_link_gb.setDecimals(1)
+        self.sp_link_gb.setSuffix(" GB")
+        self.sp_link_gb.setValue(float(cfg.get("联动盘阈值GB", 2.0) or 2.0))
+        self.sp_link_gb.valueChanged.connect(lambda _v: self._save_link_cfg())
+        row.addWidget(self.sp_link_gb)
+        row.addWidget(QLabel("就提醒一次"))
+        row.addSpacing(18)
+        row.addWidget(QLabel("默认放到"))
+        self.cmb_link_target = QComboBox()
+        self.cmb_link_target.addItem("每次问我", "")
+        try:
+            _drvs = guard_drives.list_drives()
+        except Exception:
+            _drvs = []
+        sys_letter = (engine.detect_drives()[0][0] if engine.detect_drives() else "C")
+        for d in _drvs:
+            if d["letter"] == sys_letter:
+                continue
+            self.cmb_link_target.addItem(
+                f"{d['letter']} 盘（剩 {engine.human_size(d['free'])}）",
+                f"{d['letter']}:\\{guard_linkdisk.DEFAULT_TARGET_DIRNAME}")
+        want = str(cfg.get("联动盘目标盘") or "")
+        for i in range(self.cmb_link_target.count()):
+            if self.cmb_link_target.itemData(i) == want:
+                self.cmb_link_target.setCurrentIndex(i)
+                break
+        self.cmb_link_target.currentIndexChanged.connect(lambda _i: self._save_link_cfg())
+        row.addWidget(self.cmb_link_target)
+        row.addStretch(1)
+        g1l.addLayout(row)
+        lay.addWidget(g1)
+
+        # ---- 表 + 操作 ----
+        g2, g2l = self._card()
+        g2l.addLayout(self._card_title("体检结果", "按占用从大到小排"))
+        bar = QHBoxLayout()
+        self.lbl_link = QLabel()
+        self.lbl_link.setWordWrap(True)
+        self.lbl_link.setStyleSheet(
+            f"color:{GT.C['ink2']};font-size:{GT.human_font(12.5)}pt;")
+        bar.addWidget(self.lbl_link, 1)
+        b_scan = QPushButton("🔍 立即体检")
+        b_scan.clicked.connect(self._link_scan)
+        b_make = GT.style_button(QPushButton("🔗 创建联动盘"), "primary")
+        b_make.clicked.connect(self._link_make)
+        b_undo = QPushButton("↩️ 还原到 C 盘")
+        b_undo.clicked.connect(self._link_undo)
+        b_never = QPushButton("不再提示")
+        b_never.clicked.connect(self._link_never)
+        for b in (b_scan, b_make, b_undo, b_never):
+            bar.addWidget(b)
+        g2l.addLayout(bar)
+
+        self.link_tree = QTreeWidget()
+        self.link_tree.setColumnCount(4)
+        self.link_tree.setHeaderLabels(["软件", "在 C 盘占", "状态", "数据位置"])
+        self.link_tree.setRootIsDecorated(False)
+        self.link_tree.setAlternatingRowColors(True)
+        self.link_tree.setMinimumHeight(240)
+        hh = self.link_tree.header()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.link_tree.itemDoubleClicked.connect(
+            lambda *_: self._link_make())
+        g2l.addWidget(self.link_tree)
+        lay.addWidget(g2, 1)
+        self._refresh_linkdisk()
+        return w
+
+    def _save_link_cfg(self):
+        cfg = self.guard.config
+        cfg["联动盘提醒"] = bool(self.cb_link_on.isChecked())
+        cfg["联动盘阈值GB"] = float(self.sp_link_gb.value())
+        cfg["联动盘目标盘"] = str(self.cmb_link_target.currentData() or "")
+        try:
+            self.guard.save_config()
+        except Exception:
+            pass
+
+    def _refresh_linkdisk(self):
+        if not hasattr(self, "link_tree"):
+            return
+        t = guard_linkdisk.tracker
+        cur = self._cur_link_key()
+        self.link_tree.clear()
+        rows = sorted(t.apps.items(), key=lambda kv: -(kv[1].get("size") or 0))
+        linked = freed = 0
+        for key, rec in rows:
+            size = int(rec.get("size") or 0)
+            status = t.status(key)
+            dirs = rec.get("dirs") or []
+            pos = dirs[0] if dirs else "（还没定位到数据目录，可点「立即体检」）"
+            if len(dirs) > 1:
+                pos += f" 等 {len(dirs)} 处"
+            node = QTreeWidgetItem([
+                rec.get("name") or key,
+                engine.human_size(size) if size else "—",
+                status, pos])
+            node.setData(0, Qt.UserRole, key)
+            if dirs:
+                node.setToolTip(3, "\n".join(dirs))
+            if status == "已建":
+                linked += 1
+                freed += size
+            self.link_tree.addTopLevelItem(node)
+            if key == cur:
+                self.link_tree.setCurrentItem(node)
+        self.lbl_link.setText(
+            f"共记录 {len(rows)} 个软件，已建联动盘 {linked} 个"
+            + (f"，累计腾出约 {engine.human_size(freed)}" if freed else "")
+            + "。提示会自动出现在托盘，不用一直开这个页面。")
+
+    def _cur_link_key(self):
+        it = self.link_tree.currentItem() if hasattr(self, "link_tree") else None
+        return it.data(0, Qt.UserRole) if it else ""
+
+    def _link_scan(self):
+        if getattr(self, "_link_scanning", False):
+            return
+        self._link_scanning = True
+        self.lbl_link.setText("正在体检：看看哪些软件在 C 盘存了东西…（几秒钟）")
+        th = float(self.sp_link_gb.value())
+
+        def work():
+            n0 = len(guard_linkdisk.tracker.apps)
+            try:
+                guard_linkdisk.scan_running(threshold_gb=th, min_mb=80.0)
+                guard_linkdisk.scan_installed(threshold_gb=th, min_mb=80.0)
+            except Exception:
+                pass
+            n1 = len(guard_linkdisk.tracker.apps)
+            self._link_scanning = False
+            try:
+                self.link_scan_done.emit({"added": n1 - n0, "total": n1})
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_link_scan_done(self, res):
+        self._refresh_linkdisk()
+        added = int((res or {}).get("added", 0) or 0)
+        self.lbl_link.setText(
+            self.lbl_link.text() + f"（本次新发现 {added} 个软件）")
+
+    def _link_make(self):
+        key = self._cur_link_key()
+        if not key:
+            QMessageBox.information(self, APP_NAME, "先在列表里选一个软件。")
+            return
+        t = guard_linkdisk.tracker
+        rec = t.get(key)
+        if rec.get("linked"):
+            QMessageBox.information(
+                self, APP_NAME,
+                f"「{rec.get('name')}」已经建过联动盘了。\n"
+                "要换位置请先「还原到 C 盘」，再重新创建。")
+            return
+        dirs = [d for d in (rec.get("dirs") or [])]
+        if not dirs:
+            app = {"name": rec.get("name"),
+                   "dir_name": rec.get("dir_name") or rec.get("name"),
+                   "app_dir": rec.get("app_dir"), "exe": rec.get("exe"),
+                   "key": key}
+            dirs = guard_linkdisk.find_data_dirs(app)
+            if not dirs:
+                QMessageBox.information(
+                    self, APP_NAME,
+                    "没找到这个软件在 C 盘的数据目录。\n"
+                    "它可能把数据存在别的盘，或者还没开始产生数据。")
+                return
+            m = guard_linkdisk.measure(dirs, max_seconds=3.0)
+            t.set_dirs(key, dirs, m["size"])
+            t.save()
+        name = rec.get("name") or key
+        size = int(rec.get("size") or 0)
+        target = str(self.guard.config.get("联动盘目标盘") or "").strip()
+        if not target:
+            target = self.guard.pick_drive(
+                "选择放数据的盘",
+                f"把「{name}」的数据放到哪个盘？\nC 盘只留门牌号，软件照旧能用。")
+        if not target:
+            return
+        target = guard_linkdisk.normalize_target(target)
+        ok = QMessageBox.question(
+            self, APP_NAME,
+            f"把「{name}」在 C 盘的 {engine.human_size(size) if size else '这些'}数据搬到：\n"
+            f"{target}\n\n"
+            "C 盘原地址会留一个「门牌号」，软件照旧能用；\n"
+            "搬完可以随时在这里点「还原到 C 盘」。\n\n现在开始吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        self.guard.config["联动盘目标盘"] = target
+        try:
+            self.guard.save_config()
+        except Exception:
+            pass
+        self.lbl_link.setText(f"正在搬「{name}」的数据，请稍等（别关窗口）…")
+
+        def work():
+            try:
+                res = guard_linkdisk.link_app(key, target, log=lambda *_: None)
+            except Exception as e:
+                res = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+            try:
+                self.link_job_done.emit("make", res)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _link_undo(self):
+        key = self._cur_link_key()
+        if not key:
+            QMessageBox.information(self, APP_NAME, "先在列表里选一个软件。")
+            return
+        rec = guard_linkdisk.tracker.get(key)
+        if not rec.get("linked"):
+            QMessageBox.information(self, APP_NAME, "这个软件没有联动盘。")
+            return
+        name = rec.get("name") or key
+        ok = QMessageBox.question(
+            self, APP_NAME,
+            f"把「{name}」的数据原样搬回 C 盘？\n\n"
+            "搬回后会占用 C 盘空间，但软件和数据完全不受影响。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        self.lbl_link.setText(f"正在把「{name}」的数据搬回 C 盘…")
+
+        def work():
+            try:
+                res = guard_linkdisk.unlink_app(key, log=lambda *_: None)
+            except Exception as e:
+                res = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+            try:
+                self.link_job_done.emit("undo", res)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _link_never(self):
+        key = self._cur_link_key()
+        if not key:
+            QMessageBox.information(self, APP_NAME, "先在列表里选一个软件。")
+            return
+        t = guard_linkdisk.tracker
+        t.decide(key, "never")
+        t.save()
+        self._refresh_linkdisk()
+
+    def _on_link_job_done(self, kind, res):
+        res = res or {}
+        self._refresh_linkdisk()
+        if res.get("ok"):
+            QMessageBox.information(
+                self, APP_NAME, res.get("detail", "已完成") + "。")
+        else:
+            QMessageBox.warning(
+                self, APP_NAME,
+                "没能完成：" + str(res.get("detail", "未知原因"))
+                + "\n\n所有文件都已保持在/还原到 C 盘原位，软件不受影响。")
+
+    # ========================================================
+    # 设置
+    # ========================================================
     def _build_settings_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)

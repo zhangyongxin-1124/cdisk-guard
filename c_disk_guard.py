@@ -66,6 +66,7 @@ import guard_quarantine
 import guard_wizard
 import guard_dashboard
 import guard_policy              # v6.14 可选监控盘 + 拦截白名单
+import guard_linkdisk            # v6.15 联动盘（软件数据搬到别的盘，C 盘只留门牌号）
 
 # ============================================================
 # 路径与配置
@@ -110,6 +111,18 @@ DEFAULT_CONFIG = {
     "落盘稳定秒": 1.0,
     # 命中「软件存储限制」规则时，落盘稳定后直接搬到上次选过的盘，不再弹窗
     "落盘后秒级迁移": False,
+    # ---- v6.15：联动盘 ----
+    # 首次打开某个软件 / 它在 C 盘的数据超过阈值时，主动问要不要建联动盘
+    # （联动盘 = 数据实际放别的盘，C 盘原地址只留一个 junction「门牌号」）
+    "联动盘提醒": True,
+    # 超过多少 GB 主动提醒一次（用户可在「联动盘」页改）
+    "联动盘阈值GB": 2.0,
+    # 首次使用提醒的最低占用（低于这个数没必要打扰）
+    "联动盘最小提示MB": 80,
+    # 用户选「先不用」后，多少天内不再问
+    "联动盘冷却天": 7,
+    # 上次用过的目标盘；留空则每次让用户选
+    "联动盘目标盘": "",
     # 这些路径下的写入不打扰（系统/缓存/临时/软件自动生成，问也问不完）
     "排除路径关键词": [
         "\\windows\\",
@@ -728,6 +741,16 @@ class Guard:
         self.root_known = self._load_root_known()   # 已登记的根目录文件夹名
         self.root_skip = {}                         # "稍后再问" 的冷却：name -> 下次提醒时间
         self.last_root_check = 0.0
+
+        # ---- v6.15：联动盘 ----
+        self.link_tracker = guard_linkdisk.tracker
+        self.link_q = queue.Queue(maxsize=8)        # 后台体检结果
+        self.link_scanning = False
+        self.link_busy = False                      # 正在搬数据，避免并发
+        self.last_link_check = 0.0
+        self.last_link_prompt = 0.0
+        # 刚装好守卫的第一次扫描：只静默登记，避免一开机被问十几个软件
+        self.link_first_run = not self.link_tracker.apps
 
     # ---------- 配置 / 日志 ----------
     def load_config(self):
@@ -1663,6 +1686,160 @@ class Guard:
                       f"文件已搬到：\n{dest}\n\n但 C 盘原位置的联接没建成，快捷方式可能失效。\n"
                       f"建议卸载后重新装到其他盘。", MB_ICONWARNING)
 
+    # ========================================================
+    # v6.15：联动盘（数据放别的盘，C 盘只留门牌号）
+    # ========================================================
+    def link_threshold(self) -> float:
+        try:
+            return max(0.1, float(self.config.get("联动盘阈值GB", 2.0)))
+        except (TypeError, ValueError):
+            return 2.0
+
+    def check_linkdisk(self, now):
+        """周期体检：谁刚开始用、谁在 C 盘吃超了阈值。
+
+        体检本身（枚举进程 + 算目录大小）放在后台线程，绝不让引擎主循环
+        卡在 I/O 上 —— 主循环还负责文件事件与拦截弹窗。
+        """
+        if not self.config.get("联动盘提醒", True):
+            return
+        self._consume_link_queue(now)
+        if self.link_scanning or self.link_busy:
+            return
+        if now - self.last_link_check < float(self.config.get("联动盘体检间隔秒", 90)):
+            return
+        self.last_link_check = now
+        self.link_scanning = True
+        th = self.link_threshold()
+        min_mb = float(self.config.get("联动盘最小提示MB", 80) or 80)
+
+        def work():
+            try:
+                items = guard_linkdisk.scan_running(
+                    first_prompt=True, threshold_gb=th, min_mb=min_mb,
+                    t=self.link_tracker, baseline=self.link_first_run)
+                self.link_first_run = False
+                if items:
+                    try:
+                        self.link_q.put_nowait(items)
+                    except queue.Full:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self.link_scanning = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _consume_link_queue(self, now):
+        """把后台体检结果变成一次提醒（一次只问一个，问完隔一段再问下一个）。"""
+        if now - self.last_link_prompt < guard_linkdisk.PROMPT_GAP_SEC:
+            return
+        try:
+            items = self.link_q.get_nowait()
+        except queue.Empty:
+            return
+        if not items or self.auto_choice:
+            return
+        item = items[0]
+        key = item["key"]
+        name = (item.get("app") or {}).get("name") or key
+        size = item.get("size", 0)
+        if (item.get("app") or {}).get("linked"):
+            return
+        self.last_link_prompt = now
+        decision, target = self.ask_link_disk(item)
+        if decision == "never":
+            self.link_tracker.mark_prompted(key, item["trigger"], size)
+            self.link_tracker.decide(key, "never")
+            self.link_tracker.save()
+            self.log("联动盘", name, size, "不再提示")
+            return
+        if decision == "link" and target:
+            self.config["联动盘目标盘"] = target
+            try:
+                self.save_config()
+            except Exception:
+                pass
+            self.link_tracker.mark_prompted(key, item["trigger"], size)
+            self.link_tracker.save()
+            self._start_link_job(key, item, target)
+            return
+        self.link_tracker.mark_prompted(key, item["trigger"], size)
+        self.link_tracker.decide(
+            key, "later", float(self.config.get("联动盘冷却天", 7) or 7))
+        self.link_tracker.save()
+        self.log("联动盘", name, size, "先不用(冷却)")
+
+    def ask_link_disk(self, item):
+        """返回 ("link", 目标盘根路径) / ("later", "") / ("never", "")。
+
+        GUI 版会覆写成自绘窗口；这里是非 GUI 模式（命令行/自检）的兜底。
+        """
+        if self.auto_choice:
+            return ("later", "")
+        app = item.get("app") or {}
+        name = app.get("name") or "这个软件"
+        body = guard_linkdisk.explain(
+            app, item.get("size", 0), item.get("dirs") or [],
+            item.get("trigger", ""))
+        body += ("\n\n━━━ 请选择 ━━━\n"
+                 "【是】现在就建（接着选放哪个盘）\n"
+                 "【否】先不用，过几天再问\n"
+                 "【取消】这个软件以后都别再问")
+        r = alert_box("C 盘守卫 — 给它建一个联动盘？", body,
+                      MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2)
+        if r == IDYES:
+            root = self.pick_drive(
+                "C 盘守卫 — 数据放哪个盘",
+                f"把「{name}」的数据放到哪个盘？\n（C 盘只留门牌号，软件照旧能用）")
+            return ("link", root or "")
+        if r == IDCANCEL:
+            return ("never", "")
+        return ("later", "")
+
+    def _start_link_job(self, key, item, target):
+        """后台执行搬移，完成后弹结果。搬移失败一律自动还原。"""
+        if self.link_busy:
+            return
+        self.link_busy = True
+        app = item.get("app") or {}
+        name = app.get("name") or key
+        size = item.get("size", 0)
+        self.log("联动盘", name, size, "开始创建", target)
+
+        def work():
+            try:
+                res = guard_linkdisk.link_app(
+                    key, target, log=lambda *_: None, t=self.link_tracker)
+            except Exception as e:
+                res = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+            self.link_busy = False
+            if res.get("ok"):
+                self.log("联动盘", name, size, "创建完成", target)
+                alert_box(
+                    "C 盘守卫 — 联动盘已建好",
+                    f"「{name}」的数据已经搬到：\n{target}\n\n"
+                    "C 盘原来的地址留了一个「门牌号」，软件照旧能用；\n"
+                    f"这次大约给 C 盘腾出 {human_size(size)}。\n\n"
+                    "想反悔：「联动盘」页里点「还原」就能原样搬回来。",
+                    MB_ICONINFO)
+            else:
+                self.log("联动盘", name, size, "创建失败-已还原",
+                         str(res.get("detail", ""))[:120])
+                alert_box(
+                    "C 盘守卫 — 这次没搬成",
+                    f"「{name}」的数据没能搬走：\n{res.get('detail', '未知原因')}\n\n"
+                    "文件已经全部还原到 C 盘原位，软件不受影响。\n"
+                    "最常见的原因是软件正在写这些文件 —— 先关掉软件，"
+                    "再在「联动盘」页点「创建」重试。",
+                    MB_ICONWARNING)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ========================================================
+    # 安装哨兵（原有逻辑）
+    # ========================================================
     def check_installs(self, now):
         if not self.config.get("监控软件安装", True):
             return
@@ -2128,6 +2305,7 @@ class Guard:
                 self.check_installs(now)
                 self.check_root_dirs(now)
                 self.check_growth()
+                self.check_linkdisk(now)
 
                 if now - self.last_poll > float(self.config.get("轮询间隔秒", 20)):
                     self.last_poll = now

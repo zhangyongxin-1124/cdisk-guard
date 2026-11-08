@@ -221,7 +221,7 @@ g.config["自动清理"] = dict(gc.DEFAULT_CFG)      # 保证测试可重复
 win = guard_gui.MainWindow(g, minimized=True)
 
 ck("存在「日志清理」页面", "clean" in win.nav and "clean" in win._nav_index)
-ck("侧栏共 8 个页面（v6.14 新增软件迁移）", win.stack.count() == 8,
+ck("侧栏共 9 个页面（v6.15 新增联动盘）", win.stack.count() == 9,
    f"实际 {win.stack.count()}")
 ck("清理树有 6 列", win.clean_tree.columnCount() == 6)
 ck("自动清理默认关闭", win.cb_clean_on.isChecked() is False)
