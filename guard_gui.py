@@ -79,7 +79,7 @@ import guard_theme as GT
 from guard_bridge import bridge, IDYES, IDNO, IDCANCEL, IDOK
 
 APP_NAME = "C盘守卫"
-APP_VERSION = "6.16"
+APP_VERSION = "6.17"
 ICON_PATH = _resource("guard_icon.ico")
 MB = engine  # 常量速记
 
@@ -1711,9 +1711,14 @@ class MainWindow(QMainWindow):
         idx = self._nav_index.get(key)
         if idx is None:
             return
+        self._cur_page = key            # v6.16：记录当前页，供 _auto_refresh 分流
         self.stack.setCurrentIndex(idx)
         for k, b in self.nav.items():
             b.setChecked(k == key)
+        # v6.16：概况页的数据刷新放到切页完成之后（30ms），点击瞬间零卡顿；
+        # 之前数据只在 60 秒定时器里刷，等用户切回来时经常是旧的。
+        if key == "overview":
+            QTimer.singleShot(30, self._refresh_home)
         # v6.14：首次进入「软件迁移」页时自动加载软件列表
         if key == "migrate" and getattr(self, "mig_tree", None) is not None \
                 and self.mig_tree.topLevelItemCount() == 0 \
@@ -1742,6 +1747,19 @@ class MainWindow(QMainWindow):
 
     def _refresh_home(self):
         st = engine.disk_state()
+        # v6.16：数据没变就一个控件都不碰（概况页控件多，整套重排一遍
+        # 上百毫秒）。切页进来时通常和上次刷新只差几 MB，直接跳过，
+        # 页面切换才能做到丝滑。
+        fp = (round(st["pct"], 1), st["used"], st["total"], st["free"])
+        try:
+            letters = [d["letter"] for d in guard_drives.list_drives()]
+        except Exception:
+            letters = None
+        if fp == getattr(self, "_home_fp", None) and \
+                letters == getattr(self, "_home_letters", None):
+            return
+        self._home_fp = fp
+        self._home_letters = letters
         pct = st["pct"]
         if pct >= 88:
             kind, col = "bad", GT.C["red"]
@@ -1878,6 +1896,7 @@ class MainWindow(QMainWindow):
         self.today_tree.header().setToolTip(
             "点表头可以排序：占用 / 新增时间 / 来源应用，想怎么排就怎么排")
         self.today_tree.itemDoubleClicked.connect(self._on_today_double_click)
+        self.today_tree.itemExpanded.connect(self._today_item_expanded)  # v6.16 懒加载子行
         self.today_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.today_tree.customContextMenuRequested.connect(self._today_menu)
         lay.addWidget(self.today_tree, 1)
@@ -2231,6 +2250,8 @@ class MainWindow(QMainWindow):
 
     def _fill_legacy_rows_impl(self):
         t = self.legacy_tree
+        # v6.16：与今日新增页同款优化——关排序批量插入，最后统一排一次
+        t.setSortingEnabled(False)
         t.clear()
         letter = self._legacy_drive()
         base = self._legacy_baseline()
@@ -2244,6 +2265,7 @@ class MainWindow(QMainWindow):
                 break
         used = (dinfo["used"] if dinfo else 0) or 0
 
+        nodes = []                      # v6.16：攒一批，最后一次性插入
         for r in rows:
             path = r["path"]
             if os.sep == "\\":                 # 快照里可能存着 C:/xxx 的写法
@@ -2301,12 +2323,14 @@ class MainWindow(QMainWindow):
                 it.setForeground(6, QColor("#1565c0"))
             elif after and not before:
                 it.setForeground(6, QColor("#c62828"))
-            t.addTopLevelItem(it)
+            nodes.append(it)
 
+        t.addTopLevelItems(nodes)       # v6.16：一次插入全部行
         if not rows:
             self.lbl_legacy_state.setText(
                 f"{letter} 盘还没盘点过。点上面的「🔍 盘点这块盘」，"
                 f"扫完就能看清里面都是些什么。")
+        t.setSortingEnabled(True)
         t.sortItems(2, Qt.SortOrder.DescendingOrder)
 
     # ---- 扫描 ----
@@ -2687,6 +2711,10 @@ class MainWindow(QMainWindow):
             self.today_tree.update()
 
     def _fill_today_impl(self, items):
+        # v6.16：重建期间关闭排序。之前排序开着逐条 addTopLevelItem，
+        # 每插一行就触发一次全表重排，1500 行就是 O(n²)——这是切换页面
+        # 和扫描完成时卡顿的最大来源。改为：关排序 → 批量插入 → 统一排一次。
+        self.today_tree.setSortingEnabled(False)
         self.today_tree.clear()
         self._today_items = items
         by_path = {it["path"]: it for it in items}
@@ -2713,6 +2741,7 @@ class MainWindow(QMainWindow):
             ("主要来源：" + "、".join(
                 f"{a}（{engine.human_size(s)}）" for a, s in top)) if top else "")
 
+        nodes = []                      # v6.16：攒一批，最后一次性插入
         for r in rows:
             pct = (r["size"] / denom * 100) if denom else 0.0
             pct_txt = f"{pct:.1f}%" if pct >= 0.1 else (
@@ -2761,44 +2790,69 @@ class MainWindow(QMainWindow):
                 node.setForeground(6, QColor("#c62828"))
             elif pct >= 2:
                 node.setForeground(6, QColor("#ef6c00"))
-            self.today_tree.addTopLevelItem(node)
+            nodes.append(node)          # v6.16：批量插入，不再逐行触发重排
+            # v6.16：子行（文件明细）改为「展开时才创建」——折叠状态下看不见，
+            # 之前每次重建都提前造好上千个子节点，白白多花近 200ms
+            node._group_row = r
+            node._children_built = False
 
-            names = r.get("paths", [])
-            all_paths = r.get("all_paths", [])
-            for i, nm in enumerate(names):
-                full = all_paths[i] if i < len(all_paths) else r["dir"]
-                it = by_path.get(full, {})
-                csize = int(it.get("size", 0) or 0)
-                cpct = (csize / denom * 100) if denom else 0.0
-                cts = guard_today.TodayScanner.display_ts(it) if it else 0
-                child = SortItem(
-                    ["", nm, r["app"],
-                     self._fmt_date(cts) if it else "",
-                     self._fmt_hm(cts) if it else "",
-                     engine.human_size(csize) if it else "",
-                     f"{cpct:.1f}%" if cpct >= 0.1 else "",
-                     "",
-                     risk["text"]])
-                child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-                child.setForeground(1, QColor("#888"))
-                child.setForeground(4, QColor("#888"))
-                child.setForeground(8, QColor(risk["color"]))
-                child.setData(0, Qt.UserRole,
-                              {"path": full,
-                               "is_dir": bool(it.get("is_dir", r.get("is_dir")))})
-                child.set_key(1, nm.lower())
-                child.set_key(2, r["app"])
-                child.set_key(3, float(cts or 0))
-                child.set_key(4, float(cts or 0))
-                child.set_key(5, csize)
-                child.set_key(6, cpct)
-                child.set_key(7, 0)
-                child.set_key(8, int(risk["order"]))
-                child.setToolTip(1, full)
-                child.setToolTip(8, risk["tip"])
-                node.addChild(child)
-
+        self.today_tree.addTopLevelItems(nodes)     # v6.16：一次插入全部行
+        self.today_tree.setSortingEnabled(True)     # 恢复排序，统一只排这一次
         self._apply_sort()
+
+    def _today_item_expanded(self, item):
+        """v6.16：子行懒加载——展开某个分组时才创建它的文件明细行。"""
+        if getattr(item, "_children_built", True):
+            return
+        r = getattr(item, "_group_row", None)
+        if r is None:
+            return
+        item._children_built = True
+        by_path = {it["path"]: it
+                   for it in (getattr(self, "_today_items", None) or [])}
+        dinfo = self._cur_drive_info()
+        denom = (dinfo["used"] if dinfo else 0) or 0
+        drv = getattr(self, "_cur_drive", "")
+        risk = (r.get("risk") or guard_today.move_risk(
+            r["dir"], r["app"], bool(r.get("is_dir")),
+            guard_drives.system_letter()))
+        children = []
+        names = r.get("paths", [])
+        all_paths = r.get("all_paths", [])
+        for i, nm in enumerate(names):
+            full = all_paths[i] if i < len(all_paths) else r["dir"]
+            it = by_path.get(full, {})
+            csize = int(it.get("size", 0) or 0)
+            cpct = (csize / denom * 100) if denom else 0.0
+            cts = guard_today.TodayScanner.display_ts(it) if it else 0
+            child = SortItem(
+                ["", nm, r["app"],
+                 self._fmt_date(cts) if it else "",
+                 self._fmt_hm(cts) if it else "",
+                 engine.human_size(csize) if it else "",
+                 f"{cpct:.1f}%" if cpct >= 0.1 else "",
+                 "",
+                 risk["text"]])
+            child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            child.setForeground(1, QColor("#888"))
+            child.setForeground(4, QColor("#888"))
+            child.setForeground(8, QColor(risk["color"]))
+            child.setData(0, Qt.UserRole,
+                          {"path": full,
+                           "is_dir": bool(it.get("is_dir", r.get("is_dir")))})
+            child.set_key(1, nm.lower())
+            child.set_key(2, r["app"])
+            child.set_key(3, float(cts or 0))
+            child.set_key(4, float(cts or 0))
+            child.set_key(5, csize)
+            child.set_key(6, cpct)
+            child.set_key(7, 0)
+            child.set_key(8, int(risk["order"]))
+            child.setToolTip(1, full)
+            child.setToolTip(8, risk["tip"])
+            children.append(child)
+        if children:
+            item.addChildren(children)
 
     # ---------- 右键：把选中的软件加入「不准存 C 盘」 ----------
     def _today_menu(self, pos):
@@ -3075,23 +3129,35 @@ class MainWindow(QMainWindow):
         self.start_scan()
 
     def _auto_refresh(self):
-        self._refresh_home()
-        self.refresh_selfcheck()
-        # 切到别的盘时不要自动重刷列表，免得把用户正在看的结果冲掉
-        if getattr(self, "_cur_drive", None) not in (None, guard_drives.system_letter()):
-            return
-        try:
-            self._reload_drive_if_changed()
-            data = self.scanner.load()
-            if data.get("items") and not (self.scan_thread and self.scan_thread.is_alive()):
-                # v6.13：数据指纹没变就不重建（原来每 60 秒无脑重刷大表）
-                fp = (data.get("day"), len(data.get("items") or []),
-                      data.get("total_size"), data.get("ts"))
-                if fp != getattr(self, "_today_fp", None):
-                    self._today_fp = fp
-                    self._fill_today(data["items"])
-        except Exception:
-            pass
+        # v6.16：按「当前在哪一页」分流刷新。
+        # 之前不管用户在哪页，每 60 秒都把概况 + 自检 + 今日表格全刷一遍，
+        # 全在 UI 线程上，合计 0.5 秒左右——正好撞上用户点侧栏切换，
+        # 就是「切页面非常卡」的主因。现在只刷看得见的部分，
+        # 看不见的部分等 _goto_page 进页时再刷。
+        cur = getattr(self, "_cur_page", "overview")
+        if cur == "overview":
+            self._refresh_home()
+            self._sc_tick = getattr(self, "_sc_tick", 0) + 1
+            if self._sc_tick % 5 == 1:      # 自检信息变化慢，5 分钟刷一次足够
+                self.refresh_selfcheck()
+        elif cur == "today":
+            # 切到别的盘时不要自动重刷列表，免得把用户正在看的结果冲掉
+            if getattr(self, "_cur_drive", None) not in \
+                    (None, guard_drives.system_letter()):
+                return
+            try:
+                self._reload_drive_if_changed()
+                data = self.scanner.load()
+                if data.get("items") and not (self.scan_thread and
+                                              self.scan_thread.is_alive()):
+                    # v6.13：数据指纹没变就不重建（原来每 60 秒无脑重刷大表）
+                    fp = (data.get("day"), len(data.get("items") or []),
+                          data.get("total_size"), data.get("ts"))
+                    if fp != getattr(self, "_today_fp", None):
+                        self._today_fp = fp
+                        self._fill_today(data["items"])
+            except Exception:
+                pass
 
     def _reload_drive_if_changed(self):
         """磁盘增减（插拔 U 盘）时刷新下拉，保持当前选择不变。"""

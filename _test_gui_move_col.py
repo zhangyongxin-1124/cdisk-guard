@@ -77,9 +77,12 @@ chk("微信 AppData -> appdata", lv[r"C:\Users\testuser\AppData\Roaming\WeChat F
 chk(r"Windows\Temp -> system", lv[r"C:\Windows\Temp"] == "system", lv[r"C:\Windows\Temp"])
 chk(r"F:\已有 -> other_disk", lv[r"F:\已有"] == "other_disk", lv[r"F:\已有"])
 
-print("\n== 5. 子行继承说明 ==")
+print("\n== 5. 子行继承说明（v6.17 起子行懒加载，展开后才创建）==")
 wechat = rows[r"C:\Users\testuser\AppData\Roaming\WeChat Files"]
-chk("有子行", wechat.childCount() >= 1, wechat.childCount())
+chk("填充后子行未提前创建（懒加载）", wechat.childCount() == 0, wechat.childCount())
+wechat.setExpanded(True)          # 展开 → 触发 itemExpanded 懒加载
+app.processEvents()
+chk("展开后子行补齐", wechat.childCount() >= 1, wechat.childCount())
 c = wechat.child(0)
 chk("子行也有说明文本", bool(c.text(8).strip()), repr(c.text(8)))
 chk("子行说明与父行一致", c.text(8) == wechat.text(8), f"{c.text(8)} vs {wechat.text(8)}")
@@ -115,6 +118,8 @@ chk("日期列格式 2026.11.01", bool(_re.match(r"^\d{4}\.\d{2}\.\d{2}$", it0.t
     repr(it0.text(3)))
 chk("时间列格式 18:09", bool(_re.match(r"^\d{2}:\d{2}( ~ \d{2}:\d{2})?$", it0.text(4))),
     repr(it0.text(4)))
+it0.setExpanded(True)          # v6.17 懒加载：展开后才创建子行
+app.processEvents()
 c0 = it0.child(0)
 chk("子行日期列格式正确", bool(_re.match(r"^\d{4}\.\d{2}\.\d{2}$", c0.text(3))),
     repr(c0.text(3)))
