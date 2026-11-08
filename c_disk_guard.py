@@ -190,6 +190,7 @@ DEFAULT_CONFIG = {
     "转移目标": {},
     "自动转移扩展名": [".exe", ".msi", ".msix", ".zip", ".rar", ".7z", ".iso"],
     "忽略扩展名": [".crdownload", ".part", ".tmp", ".partial", ".download"],
+    "开机自启": True,
     "轮询间隔秒": 20,
     # ---- 安装哨兵 ----
     "监控软件安装": True,
@@ -682,6 +683,26 @@ class TreeWatcher(threading.Thread):
 
 
 # ============================================================
+# 开机自启（v6.16：以配置为唯一依据）
+# ============================================================
+
+AUTOSTART_KEY_NAME = "CDiskGuard"
+AUTOSTART_RUN_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _autostart_registered() -> bool:
+    """注册表里当前是否真的存在本程序的自启项（只读，失败一律当「没有」）。"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_PATH, 0,
+                            winreg.KEY_READ) as k:
+            winreg.QueryValueEx(k, AUTOSTART_KEY_NAME)
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
 # 主控
 # ============================================================
 
@@ -756,6 +777,7 @@ class Guard:
     def load_config(self):
         cfg = json.loads(json.dumps(DEFAULT_CONFIG))
         need_write = False
+        user_cfg = {}
         if CONFIG_PATH.exists():
             try:
                 user_cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -766,6 +788,13 @@ class Guard:
             except Exception:
                 need_write = True
         else:
+            need_write = True
+
+        # 开机自启（v6.16）：改为「配置说了算」。升级上来的老配置没有这个键，
+        # 这里按注册表当前的真实状态回填一次，保证升级不改变用户的实际选择——
+        # 之前手动关掉自启的人，不会被这次升级强行打开。
+        if "开机自启" not in user_cfg:
+            cfg["开机自启"] = _autostart_registered()
             need_write = True
 
         # 换电脑适配：配置里若还写着上一台电脑的用户目录（C:\Users\别人\...），
@@ -2205,28 +2234,40 @@ class Guard:
         self.known = self.scan()
 
     # ========================================================
-    # 自启动自修复
+    # 开机自启同步（v6.16 修复）
     # ========================================================
-    @staticmethod
-    def ensure_autostart():
+    def ensure_autostart(self):
+        """按「开机自启」配置同步注册表：开则写、关则删。
+
+        v6.16 修复两个问题：
+        1. 之前无论用户是否关掉都强制写回，等于「关不掉」——
+           用户在设置里关掉自启，下次启动又被加回去。
+        2. 之前写的是 `--silent`，界面另一处写的是 `--minimized`，
+           两个实现互相覆盖。现在统一走这里，参数固定 `--minimized`。
+        """
         exe = sys.executable if getattr(sys, "frozen", False) else None
         if not exe:
             return
-        want = f'"{exe}" --silent'
+        want_on = bool(self.config.get("开机自启", True))
+        want = f'"{exe}" --minimized'
         try:
             import winreg
-            path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_PATH, 0,
                                 winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
                 try:
-                    cur, _ = winreg.QueryValueEx(k, "CDiskGuard")
+                    cur, _ = winreg.QueryValueEx(k, AUTOSTART_KEY_NAME)
                 except FileNotFoundError:
                     cur = ""
+                if not want_on:
+                    if cur:
+                        winreg.DeleteValue(k, AUTOSTART_KEY_NAME)
+                        print("    🧹 已按你的设置移除开机自启项")
+                    return
                 if cur != want:
-                    winreg.SetValueEx(k, "CDiskGuard", 0, winreg.REG_SZ, want)
-                    print("    🔧 已自动注册/修复开机自启项")
+                    winreg.SetValueEx(k, AUTOSTART_KEY_NAME, 0, winreg.REG_SZ, want)
+                    print("    🔧 已按你的设置注册开机自启项")
         except Exception as e:
-            print(f"    ⚠️ 自启动注册失败（不影响本次监控）: {type(e).__name__}")
+            print(f"    ⚠️ 自启动同步失败（不影响本次监控）: {type(e).__name__}")
 
     # ========================================================
     # 主循环

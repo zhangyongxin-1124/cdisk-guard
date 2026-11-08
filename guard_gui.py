@@ -79,7 +79,7 @@ import guard_theme as GT
 from guard_bridge import bridge, IDYES, IDNO, IDCANCEL, IDOK
 
 APP_NAME = "C盘守卫"
-APP_VERSION = "6.15"
+APP_VERSION = "6.16"
 ICON_PATH = _resource("guard_icon.ico")
 MB = engine  # 常量速记
 
@@ -1032,27 +1032,6 @@ class GuiGuard(engine.Guard):
         if act == LinkDiskDialog.NEVER:
             return ("never", "")
         return ("later", "")
-
-    # ---------- 自启动注册（桌面版启动后缩在托盘）----------
-    @staticmethod
-    def ensure_autostart():
-        exe = sys.executable if getattr(sys, "frozen", False) else None
-        if not exe:
-            return
-        want = f'"{exe}" --minimized'
-        try:
-            import winreg
-            path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
-                                winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
-                try:
-                    cur, _ = winreg.QueryValueEx(k, "CDiskGuard")
-                except FileNotFoundError:
-                    cur = ""
-                if cur != want:
-                    winreg.SetValueEx(k, "CDiskGuard", 0, winreg.REG_SZ, want)
-        except Exception:
-            pass
 
 
 # ============================================================
@@ -4588,35 +4567,19 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.information(self, APP_NAME, f"声明文件位于：\n{notice}\n\n({e})")
 
-    @staticmethod
-    def _autostart_on() -> bool:
+    def _autostart_on(self) -> bool:
+        """自启开关的初始状态：以配置为准（v6.16 起不再读注册表）。"""
         try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                                0, winreg.KEY_READ) as k:
-                winreg.QueryValueEx(k, "CDiskGuard")
-            return True
+            return bool(self.guard.config.get("开机自启", True))
         except Exception:
             return False
 
     def _set_autostart(self, on: bool):
+        """写配置 + 交由引擎统一同步注册表（避免两处各写一个参数）。"""
         try:
-            import winreg
-            exe = sys.executable if getattr(sys, "frozen", False) else None
-            if not exe:
-                return
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                                0, winreg.KEY_SET_VALUE) as k:
-                if on:
-                    winreg.SetValueEx(k, "CDiskGuard", 0, winreg.REG_SZ,
-                                      f'"{exe}" --minimized')
-                else:
-                    try:
-                        winreg.DeleteValue(k, "CDiskGuard")
-                    except FileNotFoundError:
-                        pass
+            self.guard.config["开机自启"] = bool(on)
+            self.guard.save_config()
+            self.guard.ensure_autostart()
         except Exception:
             pass
 
@@ -4671,6 +4634,7 @@ class MainWindow(QMainWindow):
             self.guard.refresh_watchers()
         except Exception:
             pass
+        cfg["开机自启"] = self.cb_autostart.isChecked()
         self.guard.save_config()
         self._set_autostart(self.cb_autostart.isChecked())
         self._refresh_rules_label()

@@ -269,6 +269,61 @@ def main() -> int:
     c.ck((ROOT / "_test_v615_linkdisk.py").exists(),
          "联动盘专项测试脚本存在")
 
+    # ---------- 11d. v6.16 合规：许可全文 + 自启可关 + 无联网 ----------
+    s_notices = read(ROOT / "THIRD_PARTY_NOTICES.txt")
+    for name, mini in (("LGPL-3.0.txt", "GNU LESSER GENERAL PUBLIC LICENSE"),
+                       ("GPL-3.0.txt", "GNU GENERAL PUBLIC LICENSE"),
+                       ("Python-3.13-LICENSE.txt", "PYTHON SOFTWARE FOUNDATION")):
+        p = ROOT / "LICENSES" / name
+        c.ck(p.exists(), f"许可全文存在：LICENSES/{name}",
+             "LGPLv3 第 4 条要求随作品提供许可证副本")
+        if p.exists():
+            c.ck(mini.lower() in p.read_text(encoding="utf-8", errors="replace").lower(),
+                 f"LICENSES/{name} 内容正确（非空壳文件）")
+
+    c.ck('"开机自启"' in s_engine, "引擎默认配置含「开机自启」",
+         "没有这个键，用户关掉自启后会被强行写回")
+    c.ck("AUTOSTART_RUN_PATH" in s_engine and "_autostart_registered" in s_engine,
+         "引擎具备开机自启的统一读写入口")
+    # 关掉时必须能删除注册表项（否则等于关不掉）
+    c.ck("DeleteValue" in s_engine and "开机自启" in s_engine,
+         "关闭自启时会删除注册表项")
+    # 只允许出现一处自启注册实现，避免两处各写一个参数
+    c.ck("CurrentVersion" not in s_gui,
+         "界面侧不再自行写注册表（统一由引擎处理）",
+         "guard_gui.py 里又出现了一处自启注册实现，会和引擎互相覆盖")
+
+    for label, txt in (("README", s_readme), ("使用说明", s_manual)):
+        for kw in ("LGPL", "LICENSES"):
+            c.ck(kw in txt, f"{label} 提到「{kw}」", "许可材料缺说明")
+        c.ck("不联网" in txt, f"{label} 写明「不联网」")
+    c.ck("LGPLv3" in s_notices and "LICENSES" in s_notices,
+         "THIRD_PARTY_NOTICES 说明 LGPLv3 与许可证位置")
+    c.ck("重新链接" in s_notices, "THIRD_PARTY_NOTICES 说明「用修改版 Qt 重新链接」的方法",
+         "LGPLv3 第 4 条要求用户可替换被链接的库")
+
+    # ---------- 11e. 合规红线：不得有联网 / 提权 / 内核驱动 ----------
+    banned = {
+        "urlopen(": "网络请求（urllib.urlopen）",
+        "requests.get(": "网络请求（requests.get）",
+        "requests.post(": "网络请求（requests.post）",
+        "socket.socket": "网络套接字",
+        "ShellExecuteW(None, \"runas\"": "请求管理员提权",
+        "FilterLoad": "加载文件系统过滤驱动",
+        "CreateServiceW": "安装系统服务",
+    }
+    py_files = [p for p in ROOT.glob("*.py")
+                if not p.name.startswith(("_test", "_gen", "_check", "_shot",
+                                          "_bench"))]
+    hits = []
+    for f in py_files:
+        t = f.read_text(encoding="utf-8", errors="replace")
+        for pat, desc in banned.items():
+            if pat in t:
+                hits.append(f"{f.name}: {desc}")
+    c.ck(not hits, "源码不含联网 / 提权 / 驱动 / 服务安装代码",
+         "发现：" + "；".join(hits))
+
     # ---------- 12. 发布包内文档（可选）----------
     if args.zip:
         zp = Path(args.zip)
@@ -291,6 +346,14 @@ def main() -> int:
                     c.ck(not any(n.endswith(".json") for n in names),
                          "发布包不含任何开发机运行数据（*.json）",
                          "发现：" + "、".join(n for n in names if n.endswith(".json")))
+                    # 许可全文必须进包（LGPLv3 第 4 条：随作品提供许可证副本）
+                    for lic in ("LGPL-3.0.txt", "GPL-3.0.txt",
+                                "Python-3.13-LICENSE.txt"):
+                        c.ck(f"LICENSES/{lic}" in names,
+                             f"发布包内含 LICENSES/{lic}",
+                             "许可全文没打进包，等于没随作品分发")
+                    c.ck("THIRD_PARTY_NOTICES.txt" in names,
+                         "发布包内含 THIRD_PARTY_NOTICES.txt")
             except zipfile.BadZipFile as e:
                 c.ck(False, "发布包是有效 zip", str(e))
 
